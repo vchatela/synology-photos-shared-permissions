@@ -26,6 +26,18 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Function to get all system users
+get_all_system_users() {
+    # Get users from the system that might need permission management
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT name FROM user_info 
+WHERE name NOT LIKE '/volume1%' 
+  AND name != '' 
+  AND name IS NOT NULL
+ORDER BY name;
+" 2>/dev/null | grep -v "^$"
+}
+
 # Function to convert database permission bitmap to ACL permissions
 # According to requirements: EVERYONE gets read-only access regardless of database permission level
 # Permission bitmap meanings:
@@ -375,29 +387,33 @@ sync_folder_permissions() {
         while IFS=: read -r username perm; do
             if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
                 apply_acl_permissions "$folder_path" "$username" "$perm"
+                # Ensure parent traversal permissions for this user
+                replace_parent_deny_with_execute "$folder_path" "$username"
             fi
         done < "$temp_file"
         rm -f "$temp_file"
-        
-        # Remove unauthorized users
-        remove_unauthorized_users "$folder_path" "$authorized_users"
     fi
     
-    # Override inherited deny rules for authorized users
-    override_inherited_deny_rules "$folder_path" "$authorized_users"
+    # Get all users and add explicit deny rules for unauthorized users
+    local all_users=$(get_all_system_users)
+    for user in $all_users; do
+        # Skip if user is authorized
+        if echo "$authorized_users" | grep -q "\b$user\b"; then
+            continue
+        fi
+        
+        # Skip system users that shouldn't be modified
+        if [[ "$user" =~ ^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal|guest|admin|root|chef)$ ]]; then
+            continue
+        fi
+        
+        # Add explicit deny rule for unauthorized users
+        # Note: These may be removed later by child folder processing if traversal access is needed
+        log_info "Adding explicit deny rule for unauthorized user '$user'"
+        synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--" 2>/dev/null || true
+    done
     
-    # Deny users who have inherited permissions but no database permissions
-    deny_inherited_unauthorized_users "$folder_path" "$authorized_users"
-    
-    # Remove conflicting deny rules from current directory only
-    # This handles cases where explicit allow permissions conflict with deny rules
-    # During batch processing, we don't modify parent directories to avoid conflicts
-    remove_local_conflicting_deny_rules "$folder_path" "$authorized_users"
-    
-    # Ensure parent folder traversal permissions
-    ensure_parent_traversal_permissions "$folder_path" "$authorized_users"
-    
-    # Clean up duplicate and redundant ACL entries
+    # Clean up duplicate ACL entries
     cleanup_acl_duplicates "$folder_path"
     
     log_info "Permission sync completed for folder ID: $folder_id"
@@ -428,8 +444,9 @@ remove_local_conflicting_deny_rules() {
         
         # Step 2: Check if user has inherited deny rules that would conflict
         if has_inherited_deny_rule "$folder_path" "$user"; then
-            log_info "User '$user' has inherited deny rule - checking parent directories"
-            remove_parent_deny_rules_for_user "$folder_path" "$user"
+            log_info "User '$user' has inherited deny rule - replacing parent deny with execute-only"
+            # Replace parent deny rules with execute-only permissions for traversal
+            replace_parent_deny_with_execute "$folder_path" "$user"
         fi
     done
 }
@@ -496,8 +513,8 @@ has_inherited_deny_rule() {
     fi
 }
 
-# Function to remove deny rules from parent directories for a specific user
-remove_parent_deny_rules_for_user() {
+# Function to replace parent deny rules with execute-only permissions for a specific user
+replace_parent_deny_with_execute() {
     local folder_path="$1"
     local user="$2"
     
@@ -511,17 +528,85 @@ remove_parent_deny_rules_for_user() {
     
     # Check if parent directory has ACL
     if ! synoacltool -get "$parent_path" >/dev/null 2>&1; then
-        log_info "Parent directory $parent_path has no ACL, skipping deny rule cleanup"
+        log_info "Parent directory $parent_path has no ACL, skipping"
         return 0
     fi
     
-    log_info "Checking parent '$parent_path' for deny rules for user '$user'"
+    # Check if user has database permission for parent - if yes, don't change anything
+    local parent_folder_id=$(get_folder_id_from_path "$parent_path")
+    if [ -n "$parent_folder_id" ]; then
+        if user_has_database_permission "$parent_folder_id" "$user"; then
+            log_info "User '$user' has database permission for parent '$parent_path' - no need to change"
+            return 0
+        fi
+    fi
     
-    # Remove level:0 deny rules from parent directory
-    remove_level0_deny_rules_from_directory "$parent_path" "$user"
+    log_info "User '$user' needs traversal access to parent '$parent_path' but no database permission - replacing deny with execute-only"
+    
+    # Check if user has level:0 deny rules in parent
+    local parent_acl=$(synoacltool -get "$parent_path" 2>/dev/null)
+    local deny_entries=$(echo "$parent_acl" | grep "user:$user:deny:" | grep "level:0")
+    
+    if [ -n "$deny_entries" ]; then
+        # Remove all level:0 deny rules for this user from parent
+        local deny_indices=$(echo "$parent_acl" | grep -n "user:$user:deny:" | grep "level:0" | cut -d: -f1)
+        for line_num in $(echo "$deny_indices" | sort -nr); do
+            # Convert line number to ACL index
+            local acl_index=$(echo "$parent_acl" | sed -n "${line_num}p" | sed 's/.*\[\([0-9]*\)\].*/\1/')
+            log_info "Removing deny rule at index $acl_index from parent '$parent_path'"
+            synoacltool -del "$parent_path" "$acl_index" 2>/dev/null || log_warn "Failed to remove deny rule"
+            # Refresh ACL after deletion
+            parent_acl=$(synoacltool -get "$parent_path" 2>/dev/null)
+        done
+        
+        # Add execute-only permission for traversal
+        log_info "Adding execute-only permission for user '$user' on parent '$parent_path'"
+        synoacltool -add "$parent_path" "user:$user:allow:--x----------:fd--" 2>/dev/null || log_warn "Failed to add execute permission"
+    else
+        # Check if user already has execute permission
+        local exec_entries=$(echo "$parent_acl" | grep "user:$user:allow:" | grep "level:0")
+        if [ -z "$exec_entries" ]; then
+            log_info "Adding execute-only permission for user '$user' on parent '$parent_path'"
+            synoacltool -add "$parent_path" "user:$user:allow:--x----------:fd--" 2>/dev/null || log_warn "Failed to add execute permission"
+        fi
+    fi
     
     # Recursively check grandparent directories
-    remove_parent_deny_rules_for_user "$parent_path" "$user"
+    replace_parent_deny_with_execute "$parent_path" "$user"
+}
+
+# Function to get folder ID from filesystem path
+get_folder_id_from_path() {
+    local folder_path="$1"
+    # Convert filesystem path to database path format
+    local db_path="${folder_path#/volume1/photo}"
+    if [ -z "$db_path" ]; then
+        db_path="/"
+    fi
+    
+    # Query database for folder ID
+    su - postgres -c "psql -d synofoto -t -A -c \"SELECT id FROM folder WHERE name = '$db_path';\"" 2>/dev/null
+}
+
+# Function to check if user has database permission for a specific folder
+user_has_database_permission() {
+    local folder_id="$1"
+    local username="$2"
+    
+    # Query database to check if user has permission for this folder
+    local permission=$(su - postgres -c "psql -d synofoto -t -A -c \"
+SELECT sp.permission
+FROM share_permission sp
+JOIN user_info ui ON sp.target_id = ui.id
+JOIN folder f ON f.passphrase_share = sp.passphrase_share
+WHERE f.id = $folder_id AND ui.name = '$username' AND sp.permission > 0;
+\"" 2>/dev/null)
+    
+    if [ -n "$permission" ]; then
+        return 0  # User has permission
+    else
+        return 1  # User does not have permission
+    fi
 }
 
 # Function to ensure users can traverse parent folders to reach their authorized subfolder

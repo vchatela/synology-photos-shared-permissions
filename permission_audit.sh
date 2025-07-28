@@ -104,10 +104,20 @@ test_filesystem_access() {
     # Escape the folder path properly for shell execution
     local escaped_path=$(printf '%q' "$folder_path")
     
-    # Try to list the directory as the user
+    # Test if user can actually read/list the directory contents
     if su "$username" -s /bin/bash -c "ls $escaped_path >/dev/null 2>&1"; then
+        # User can list directory contents - they have full read access
         echo "accessible"
+        return
+    fi
+    
+    # Cannot list directory - check if they have execute-only (traversal) access
+    # by testing if they can change into the directory
+    if su "$username" -s /bin/bash -c "cd $escaped_path 2>/dev/null && pwd >/dev/null 2>&1"; then
+        # Can access directory but not list it - execute-only (traversal)
+        echo "traversal_only"
     else
+        # Cannot even access the directory - explicit deny or no permissions
         echo "denied"
     fi
 }
@@ -211,14 +221,14 @@ run_summary_audit() {
                 has_db_access="true"
             fi
             
-            # Test filesystem access
-            local fs_access=$(test_filesystem_access "$username" "$folder_path")
-            local has_fs_access="false"
-            if [ "$fs_access" = "accessible" ]; then
-                has_fs_access="true"
-            fi
-            
-            # Check alignment
+        # Test filesystem access
+        local fs_access=$(test_filesystem_access "$username" "$folder_path")
+        local has_fs_access="false"
+        if [ "$fs_access" = "accessible" ]; then
+            has_fs_access="true"
+        fi
+        # Note: traversal_only access is treated as "no effective access" for DB comparison
+        # since DB permissions should grant full read access, not just traversal            # Check alignment
             if [ "$has_db_access" != "$has_fs_access" ]; then
                 ((folder_mismatches++))
                 ((total_mismatches++))
@@ -354,6 +364,8 @@ audit_folder() {
             has_fs_access="true"
             ((fs_accessible_users++))
         fi
+        # Note: traversal_only access is treated as "no effective access" for DB comparison
+        # since DB permissions should grant full read access, not just traversal
         
         # For detailed debugging of mismatches, check ACL details
         local acl_analysis=""
@@ -367,12 +379,20 @@ audit_folder() {
             if [ "$has_db_access" = "true" ]; then
                 log_success "  ✓ $username: DB permission ($db_perm) + FS accessible - ALIGNED"
             else
-                log_success "  ✓ $username: No DB permission + FS denied - ALIGNED"
+                if [ "$fs_access" = "traversal_only" ]; then
+                    log_success "  ✓ $username: No DB permission + FS traversal-only - ALIGNED (traversal for child access)"
+                else
+                    log_success "  ✓ $username: No DB permission + FS denied - ALIGNED"
+                fi
             fi
         else
             ((mismatched_users++))
             if [ "$has_db_access" = "true" ] && [ "$has_fs_access" = "false" ]; then
-                log_mismatch "  ✗ $username: Has DB permission ($db_perm) but FS DENIED - MISMATCH (ACL: $acl_analysis)"
+                if [ "$fs_access" = "traversal_only" ]; then
+                    log_mismatch "  ✗ $username: Has DB permission ($db_perm) but only FS TRAVERSAL - MISMATCH (ACL: $acl_analysis)"
+                else
+                    log_mismatch "  ✗ $username: Has DB permission ($db_perm) but FS DENIED - MISMATCH (ACL: $acl_analysis)"
+                fi
             elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
                 log_mismatch "  ✗ $username: No DB permission but FS ACCESSIBLE - MISMATCH (ACL: $acl_analysis)"
             fi
@@ -552,6 +572,7 @@ audit_user() {
             has_fs_access="true"
             ((user_has_fs_access++))
         fi
+        # Note: traversal_only access is treated as "no effective access" for DB comparison
         
         # For detailed debugging of mismatches, check ACL details
         local acl_analysis=""
@@ -568,7 +589,11 @@ audit_user() {
         else
             ((mismatched_folders++))
             if [ "$has_db_access" = "true" ] && [ "$has_fs_access" = "false" ]; then
-                log_mismatch "  ✗ Folder $folder_id ($folder_name): Has DB perm ($db_perm) but FS DENIED (ACL: $acl_analysis)"
+                if [ "$fs_access" = "traversal_only" ]; then
+                    log_mismatch "  ✗ Folder $folder_id ($folder_name): Has DB perm ($db_perm) but only FS TRAVERSAL (ACL: $acl_analysis)"
+                else
+                    log_mismatch "  ✗ Folder $folder_id ($folder_name): Has DB perm ($db_perm) but FS DENIED (ACL: $acl_analysis)"
+                fi
             elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
                 log_mismatch "  ✗ Folder $folder_id ($folder_name): No DB perm but FS ACCESSIBLE (ACL: $acl_analysis)"
             fi
