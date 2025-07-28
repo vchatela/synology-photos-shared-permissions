@@ -2,32 +2,88 @@
 
 ## Overview
 
-Successfully implemented a solution to align Synology Photos database permissions with filesystem ACLs for folder ID 92 ("/Scans").
+Successfully implemented a comprehensive solution to align Synology Photos database permissions with filesystem ACLs across all shared folders, with proper handling of orphaned ownership and advanced audit capabilities.
+
+## Critical Bug Fixes
+
+### Whitespace Handling in Database Queries
+**Issue**: PostgreSQL queries using `xargs` were incorrectly trimming whitespace from folder names, causing scripts to fail on folders with multiple spaces (e.g., "Concert Jaïn  - 11-05-19" becoming "Concert Jaïn - 11-05-19").
+
+**Impact**: 
+- `permission_audit.sh` reported folders as "missing" when they actually existed
+- `sync_permissions.sh` and `batch_sync.sh` would fail to process folders with multiple spaces
+- Affected numerous folders with names containing multiple consecutive spaces
+
+**Solution**: 
+- Replaced `psql -t | xargs` with `psql -t -A` in all scripts
+- Removed `xargs` which was collapsing whitespace 
+- Added `-A` flag for unaligned output to maintain exact spacing
+- Fixed in: `permission_audit.sh`, `sync_permissions.sh`, `batch_sync.sh`
+
+**Files Updated**:
+```bash
+# Before (incorrect - trims whitespace)
+local folder_name=$(psql -t -c "SELECT name FROM folder WHERE id = $id;" | xargs)
+
+# After (correct - preserves exact spacing)  
+local folder_name=$(psql -t -A -c "SELECT name FROM folder WHERE id = $id;")
+```
 
 ## What We Accomplished
 
-### 1. Database Analysis
-- Successfully connected to the `synofoto` PostgreSQL database
-- Identified folder ID 92 corresponds to "/Scans" directory
-- Retrieved user permissions from the database:
-  - `valentin` (UID 1026): permission 15
-  - `bonzac` (UID 1033): permission 3  
-  - `mathilde` (UID 1028): permission 3
-  - `famille` (UID 1029): permission 3
+### 1. Orphaned Ownership Resolution
+- **Fixed 105 orphaned folders** with UID 138862 (old PhotoStation user)
+- Enhanced `fix_ownership.sh` to process all directory levels (removed `-maxdepth 1` restriction)
+- Changed ownership to SynologyPhotos service user (UID: 105733)
+- Comprehensive scan identified and resolved nested orphaned folders
 
-### 2. Permission Strategy
+### 2. Database Analysis & Permission Mapping
+- Successfully connected to the `synofoto` PostgreSQL database
+- Created queries to map folder IDs to filesystem paths
+- Implemented user permission retrieval with proper filtering
+- Excluded system users: guest, admin, root, chef, temp_adm
+
+### 3. ACL Inheritance Bug Discovery & Fix
+- **Critical finding**: Most folders had only `level:1` (inherited) ACL entries
+- **Root cause**: No `level:0` (explicit) ACL entries to override restrictive base permissions
+- **Impact**: Users with database permissions couldn't access folders due to `d---------` base permissions
+- **Solution**: Enhanced `sync_permissions.sh` with `deny_inherited_unauthorized_users()` function
+
+### 4. Permission Strategy
 - **Read-only approach**: All users with database permissions (>0) get read-only filesystem access
 - **No write permissions**: Even users with "upload" permissions in the database only get read access on filesystem
-- **Security-first**: This prevents privilege escalation while ensuring consistency
+- **Security-first**: Prevents privilege escalation while ensuring consistency
+- **Explicit ACL rules**: Add level:0 explicit deny rules for users with inherited permissions but no database access
 
-### 3. Scripts Created
+### 5. Scripts Created & Enhanced
+
+#### `fix_ownership.sh`
+- Repair orphaned ownership from PhotoStation migration across all directory levels
+- **Key enhancement**: Removed `-maxdepth 1` to process nested folders
+- Successfully fixed 105 orphaned UID 138862 folders
+- Comprehensive directory traversal and summary reporting
 
 #### `sync_permissions.sh`
 - Main synchronization script that aligns filesystem ACLs with database permissions
-- Safely handles existing ACL entries
+- **Enhanced with inheritance handling**: `deny_inherited_unauthorized_users()` function
+- Safely handles existing ACL entries and properly manages ACL hierarchy
 - Only grants read-only access regardless of database permission level
-- Automatically removes unauthorized users
+- Automatically removes unauthorized users with explicit level:0 deny rules
 - Preserves system deny rules for service accounts
+
+#### `batch_sync.sh`
+- Batch processing script for all shared folders (447 total)
+- Comprehensive logging and progress tracking
+- Processes folders in parallel for efficiency
+- Handles errors gracefully and provides detailed reports
+
+#### `permission_audit.sh` 
+- **New comprehensive audit tool** for database vs filesystem permission alignment
+- Multiple modes: full-audit, summary, single folder, single user analysis
+- Advanced ACL analysis with inheritance level detection
+- System user filtering (excludes admin/system accounts)
+- Detailed mismatch reporting with ACL diagnosis
+- Proper logging to `logs/` directory with timestamped files
 
 #### `validate_permissions.sh`  
 - Validation script to test that permissions are working correctly
@@ -35,21 +91,25 @@ Successfully implemented a solution to align Synology Photos database permission
 - Verifies that write access is properly denied
 - Shows current ACL status
 
-### 4. Validation Results
+### 6. Comprehensive Audit Results
 
-✅ **All tests passed:**
-- `valentin`: READ ✓, WRITE denied ✓
-- `bonzac`: READ ✓, WRITE denied ✓  
-- `mathilde`: READ ✓, WRITE denied ✓
-- `famille`: READ ✓, WRITE denied ✓
-- Unauthorized users: Access properly denied ✓
+**Latest Audit Summary** (447 total shared folders):
+- **Fully aligned folders**: ~429 folders (95% success rate)
+- **Misaligned folders**: ~18 folders with permission mismatches
+- **Missing folders**: 0 (all database folders exist on filesystem)
 
-### 5. Current ACL Structure
+**Common mismatch patterns identified**:
+- Users with inherited permissions but no database access (need explicit deny)
+- Users with database permissions but no filesystem access (need explicit allow)
+- ACL inheritance issues where level:1 rules don't override base permissions
 
-The `/volume1/photo/Scans` folder now has:
+### 7. Current ACL Structure
+
+Properly configured folders now have:
 - System deny rules for service accounts (backup, webdav_syno-j, etc.)
-- Allow rule for administrators group (for admin access)
-- Individual user allow rules for database-authorized users (read-only)
+- Allow rule for administrators group (for admin access)  
+- **Level:0 explicit user rules** for database-authorized users (read-only)
+- **Level:0 explicit deny rules** for unauthorized users (overrides inheritance)
 
 ## Usage
 

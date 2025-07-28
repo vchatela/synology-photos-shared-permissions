@@ -4,6 +4,19 @@
 # This script compares Synology Photos database permissions with actual filesystem access
 # and provides a comprehensive report of alignment and discrepancies
 
+# Set up logging
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+LOG_FILE="$LOG_DIR/permission_audit_$(date +%Y%m%d_%H%M%S).log"
+
+# Create logs directory if it doesn't exist
+mkdir -p "$LOG_DIR"
+
+# Function to log to both console and file
+log_to_file() {
+    echo "$1" | tee -a "$LOG_FILE"
+}
+
 # Color output
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -14,27 +27,27 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    echo -e "${GREEN}[INFO]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 log_audit() {
-    echo -e "${BLUE}[AUDIT]${NC} $1"
+    echo -e "${BLUE}[AUDIT]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 log_success() {
-    echo -e "${CYAN}[SUCCESS]${NC} $1"
+    echo -e "${CYAN}[SUCCESS]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 log_mismatch() {
-    echo -e "${MAGENTA}[MISMATCH]${NC} $1"
+    echo -e "${MAGENTA}[MISMATCH]${NC} $1" | tee -a "$LOG_FILE"
 }
 
 # Function to get all users from database
@@ -88,11 +101,47 @@ test_filesystem_access() {
     local username=$1
     local folder_path=$2
     
+    # Escape the folder path properly for shell execution
+    local escaped_path=$(printf '%q' "$folder_path")
+    
     # Try to list the directory as the user
-    if su "$username" -s /bin/bash -c "ls '$folder_path' >/dev/null 2>&1"; then
+    if su "$username" -s /bin/bash -c "ls $escaped_path >/dev/null 2>&1"; then
         echo "accessible"
     else
         echo "denied"
+    fi
+}
+
+# Function to check comprehensive ACL inheritance
+check_comprehensive_acl() {
+    local username=$1
+    local folder_path=$2
+    
+    # Get all ACL entries for this user (all inheritance levels)
+    local acl_entries=$(synoacltool -get "$folder_path" 2>/dev/null | grep "user:$username:" || true)
+    
+    if [ -z "$acl_entries" ]; then
+        echo "no_acl"
+        return
+    fi
+    
+    # Check if user has explicit level 0 permissions (these override inheritance)
+    local has_level0=$(echo "$acl_entries" | grep "level:0" || true)
+    
+    # Check if user has any allow permissions at any level
+    local has_allow=$(echo "$acl_entries" | grep -E ":(allow|ALLOW):" | grep -E ":(r|read)" || true)
+    
+    # Check if user has explicit deny at level 0 (which overrides inheritance)
+    local has_level0_deny=$(echo "$acl_entries" | grep "level:0" | grep -E ":(deny|DENY):" || true)
+    
+    if [ -n "$has_level0_deny" ]; then
+        echo "explicit_deny_level0"
+    elif [ -n "$has_level0" ]; then
+        echo "has_level0_explicit"
+    elif [ -n "$has_allow" ]; then
+        echo "inherited_allow_only"
+    else
+        echo "no_access"
     fi
 }
 
@@ -110,10 +159,122 @@ get_folder_path() {
 # Function to check if folder exists on filesystem
 folder_exists() {
     local folder_path=$1
-    [ -d "$folder_path" ]
+    # Use stat instead of -d test since -d might fail with restrictive permissions
+    stat "$folder_path" >/dev/null 2>&1
 }
 
-# Function to audit a single folder
+# Function to run summary audit (without detailed folder output)
+run_summary_audit() {
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "        SYNOLOGY PHOTOS PERMISSION AUDIT SUMMARY" | tee -a "$LOG_FILE"
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "Started at: $(date)" | tee -a "$LOG_FILE"
+    echo "Log file: $LOG_FILE" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+    
+    log_audit "Running quick alignment check across all folders..."
+    echo
+    
+    local total_folders=0
+    local aligned_folders=0
+    local misaligned_folders=0
+    local missing_folders=0
+    local total_mismatches=0
+    
+    # Process each shared folder silently
+    while IFS='|' read -r folder_id folder_name; do
+        if [ -z "$folder_id" ] || [ -z "$folder_name" ]; then continue; fi
+        
+        ((total_folders++))
+        
+        local folder_path=$(get_folder_path "$folder_name")
+        if ! folder_exists "$folder_path"; then
+            ((missing_folders++))
+            continue
+        fi
+        
+        local folder_mismatches=0
+        
+        # Check each user for this folder
+        while IFS= read -r username; do
+            if [ -z "$username" ]; then continue; fi
+            
+            # Get database permission
+            local db_perm=$(get_db_permission "$folder_id" "$username")
+            local has_db_access="false"
+            if [ -n "$db_perm" ] && [ "$db_perm" -gt 0 ]; then
+                has_db_access="true"
+            fi
+            
+            # Test filesystem access
+            local fs_access=$(test_filesystem_access "$username" "$folder_path")
+            local has_fs_access="false"
+            if [ "$fs_access" = "accessible" ]; then
+                has_fs_access="true"
+            fi
+            
+            # Check alignment
+            if [ "$has_db_access" != "$has_fs_access" ]; then
+                ((folder_mismatches++))
+                ((total_mismatches++))
+            fi
+            
+        done < <(get_all_users)
+        
+        if [ "$folder_mismatches" -eq 0 ]; then
+            ((aligned_folders++))
+        else
+            ((misaligned_folders++))
+            log_warn "Folder $folder_id ($folder_name): $folder_mismatches mismatches"
+        fi
+        
+    done < <(get_all_shared_folders | tr '\t' '|')
+    
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "                SUMMARY RESULTS" | tee -a "$LOG_FILE"
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "Completed at: $(date)" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+    
+    log_audit "Overall Statistics:"
+    log_audit "  Total shared folders: $total_folders"
+    log_audit "  Fully aligned folders: $aligned_folders"
+    log_audit "  Misaligned folders: $misaligned_folders"
+    log_audit "  Missing folders: $missing_folders"
+    log_audit "  Total individual mismatches: $total_mismatches"
+    echo
+    
+    if [ "$misaligned_folders" -eq 0 ] && [ "$missing_folders" -eq 0 ]; then
+        log_success "🎉 ALL FOLDERS ARE PERFECTLY ALIGNED!"
+        log_success "Database permissions match filesystem access for all users and folders."
+    else
+        log_warn "⚠ MISALIGNMENTS DETECTED:"
+        if [ "$misaligned_folders" -gt 0 ]; then
+            log_warn "  - $misaligned_folders folders have permission mismatches"
+            log_warn "  - $total_mismatches total individual user/folder mismatches"
+        fi
+        if [ "$missing_folders" -gt 0 ]; then
+            log_warn "  - $missing_folders folders are missing from filesystem"
+        fi
+        echo
+        log_audit "Recommendations:"
+        log_audit "  1. Run 'fix_ownership.sh fix-all' to fix ownership issues"
+        log_audit "  2. Run 'batch_sync.sh' to sync all folder permissions"
+        log_audit "  3. Run 'permission_audit.sh full-audit' for detailed analysis"
+        log_audit "  4. Re-run this audit to verify fixes"
+    fi
+    
+    echo
+    local success_rate=$(( (aligned_folders * 100) / total_folders ))
+    log_audit "Alignment Success Rate: $success_rate%"
+    
+    # Return appropriate exit code
+    if [ "$misaligned_folders" -eq 0 ] && [ "$missing_folders" -eq 0 ]; then
+        return 0
+    else
+        return 1
+    fi
+}
 audit_folder() {
     local folder_id=$1
     local folder_name=$2
@@ -158,6 +319,12 @@ audit_folder() {
             ((fs_accessible_users++))
         fi
         
+        # For detailed debugging of mismatches, check ACL details
+        local acl_analysis=""
+        if [ "$has_db_access" != "$has_fs_access" ]; then
+            acl_analysis=$(check_comprehensive_acl "$username" "$folder_path")
+        fi
+        
         # Check alignment
         if [ "$has_db_access" = "$has_fs_access" ]; then
             ((aligned_users++))
@@ -169,9 +336,9 @@ audit_folder() {
         else
             ((mismatched_users++))
             if [ "$has_db_access" = "true" ] && [ "$has_fs_access" = "false" ]; then
-                log_mismatch "  ✗ $username: Has DB permission ($db_perm) but FS DENIED - MISMATCH"
+                log_mismatch "  ✗ $username: Has DB permission ($db_perm) but FS DENIED - MISMATCH (ACL: $acl_analysis)"
             elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
-                log_mismatch "  ✗ $username: No DB permission but FS ACCESSIBLE - MISMATCH"
+                log_mismatch "  ✗ $username: No DB permission but FS ACCESSIBLE - MISMATCH (ACL: $acl_analysis)"
             fi
         fi
         
@@ -196,11 +363,12 @@ audit_folder() {
 
 # Function to run full audit
 run_full_audit() {
-    echo "======================================================"
-    echo "        SYNOLOGY PHOTOS PERMISSION AUDIT"
-    echo "======================================================"
-    echo "Started at: $(date)"
-    echo
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "        SYNOLOGY PHOTOS PERMISSION AUDIT" | tee -a "$LOG_FILE"
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "Started at: $(date)" | tee -a "$LOG_FILE"
+    echo "Log file: $LOG_FILE" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
     
     log_audit "Discovering all users and shared folders..."
     echo
@@ -230,11 +398,11 @@ run_full_audit() {
         
     done < <(get_all_shared_folders | tr '\t' '|')
     
-    echo "======================================================"
-    echo "                AUDIT SUMMARY"
-    echo "======================================================"
-    echo "Completed at: $(date)"
-    echo
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "                AUDIT SUMMARY" | tee -a "$LOG_FILE"
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "Completed at: $(date)" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
     log_audit "Overall Statistics:"
     log_audit "  Total shared folders: $total_folders"
     log_audit "  Fully aligned folders: $aligned_folders"
@@ -283,7 +451,7 @@ audit_single_folder() {
     echo
     
     # Get folder name
-    local folder_name=$(sudo -u postgres psql -d synofoto -t -c "SELECT name FROM folder WHERE id = $folder_id;" 2>/dev/null | xargs)
+    local folder_name=$(sudo -u postgres psql -d synofoto -t -A -c "SELECT name FROM folder WHERE id = $folder_id;" 2>/dev/null)
     
     if [ -z "$folder_name" ]; then
         log_error "Folder ID $folder_id not found in database"
@@ -349,6 +517,12 @@ audit_user() {
             ((user_has_fs_access++))
         fi
         
+        # For detailed debugging of mismatches, check ACL details
+        local acl_analysis=""
+        if [ "$has_db_access" != "$has_fs_access" ]; then
+            acl_analysis=$(check_comprehensive_acl "$target_user" "$folder_path")
+        fi
+        
         # Check alignment
         if [ "$has_db_access" = "$has_fs_access" ]; then
             ((aligned_folders++))
@@ -358,9 +532,9 @@ audit_user() {
         else
             ((mismatched_folders++))
             if [ "$has_db_access" = "true" ] && [ "$has_fs_access" = "false" ]; then
-                log_mismatch "  ✗ Folder $folder_id ($folder_name): Has DB perm ($db_perm) but FS DENIED"
+                log_mismatch "  ✗ Folder $folder_id ($folder_name): Has DB perm ($db_perm) but FS DENIED (ACL: $acl_analysis)"
             elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
-                log_mismatch "  ✗ Folder $folder_id ($folder_name): No DB perm but FS ACCESSIBLE"
+                log_mismatch "  ✗ Folder $folder_id ($folder_name): No DB perm but FS ACCESSIBLE (ACL: $acl_analysis)"
             fi
         fi
         
@@ -388,15 +562,19 @@ show_usage() {
     echo "Usage: $0 [command] [options]"
     echo
     echo "Commands:"
-    echo "  full-audit           - Audit all users and folders (default)"
+    echo "  full-audit           - Audit all users and folders with detailed output (default)"
+    echo "  summary              - Quick summary audit without detailed folder output"
     echo "  folder <folder_id>   - Audit specific folder"
     echo "  user <username>      - Audit specific user across all folders"
     echo "  help                 - Show this help message"
     echo
     echo "Examples:"
-    echo "  $0                   - Run full audit"
+    echo "  $0                   - Run full detailed audit"
+    echo "  $0 summary           - Run quick summary audit"
     echo "  $0 folder 432        - Audit folder ID 432"
     echo "  $0 user famille      - Audit user 'famille' across all folders"
+    echo
+    echo "All results are logged to: logs/permission_audit_YYYYMMDD_HHMMSS.log"
 }
 
 # Function to validate prerequisites
@@ -428,6 +606,9 @@ main() {
     case "$command" in
         "full-audit"|"")
             run_full_audit
+            ;;
+        "summary")
+            run_summary_audit
             ;;
         "folder")
             local folder_id=$2

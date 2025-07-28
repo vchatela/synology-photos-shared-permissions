@@ -29,7 +29,7 @@ log_batch() {
 # Function to get folder name from database
 get_folder_name() {
     local folder_id=$1
-    su - postgres -c "psql -d synofoto -t -c \"SELECT name FROM folder WHERE id = $folder_id;\"" 2>/dev/null | xargs
+    su - postgres -c "psql -d synofoto -t -A -c \"SELECT name FROM folder WHERE id = $folder_id;\"" 2>/dev/null
 }
 
 # Function to get all shared folder IDs from database

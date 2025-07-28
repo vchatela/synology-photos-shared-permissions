@@ -63,7 +63,7 @@ WHERE f.id = $folder_id AND sp.target_id != 0 AND sp.permission > 0;
 # Function to get folder path from database
 get_folder_path() {
     local folder_id=$1
-    local folder_name=$(su - postgres -c "psql -d synofoto -t -c \"SELECT name FROM folder WHERE id = $folder_id;\"" | xargs)
+    local folder_name=$(su - postgres -c "psql -d synofoto -t -A -c \"SELECT name FROM folder WHERE id = $folder_id;\"" 2>/dev/null)
     
     # Convert database folder name to filesystem path
     # Database stores "/Scans" but filesystem is "/volume1/photo/Scans"
