@@ -106,10 +106,13 @@ cleanup_acl_duplicates() {
         # Get all indices for this user, sorted in reverse order for safe removal
         local user_indices=$(echo "$current_acl" | grep "user:$username:" | sed 's/.*\[\([0-9]*\)\].*/\1/' | sort -nr)
         
-        # Track what we want to keep - prioritize level:0 entries
+        # Track what we want to keep - only remove TRUE duplicates of the same type and level
         local kept_level0_allow=""
         local kept_level0_deny=""
-        local first_entry="true"
+        local kept_level1_allow=""
+        local kept_level1_deny=""
+        local kept_level2_allow=""
+        local kept_level2_deny=""
         
         # Process each entry for this user (in reverse order for safe removal)
         for index in $user_indices; do
@@ -140,31 +143,48 @@ cleanup_acl_duplicates() {
                     fi
                 fi
             elif echo "$entry_line" | grep -q "level:1"; then
-                # Remove level:1 entries if we have level:0 entries (explicit overrides inherited)
-                if [ -n "$kept_level0_allow" ] || [ -n "$kept_level0_deny" ]; then
-                    log_info "Removing redundant level:1 entry at index $index for $username (overridden by level:0)"
-                    synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                    # Update ACL after removal
-                    current_acl=$(synoacltool -get "$folder_path")
-                else
-                    # Keep first level:1 entry if no level:0 exists
-                    if [ "$first_entry" = "true" ]; then
-                        log_info "Keeping level:1 entry at index $index for $username (no level:0 override)"
-                        first_entry="false"
+                if echo "$entry_line" | grep -q ":allow:"; then
+                    if [ -z "$kept_level1_allow" ]; then
+                        kept_level1_allow="$index"
+                        log_info "Keeping level:1 allow entry at index $index for $username"
                     else
-                        log_info "Removing duplicate level:1 entry at index $index for $username"
+                        log_info "Removing duplicate level:1 allow entry at index $index for $username"
+                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
+                        # Update ACL after removal
+                        current_acl=$(synoacltool -get "$folder_path")
+                    fi
+                elif echo "$entry_line" | grep -q ":deny:"; then
+                    if [ -z "$kept_level1_deny" ]; then
+                        kept_level1_deny="$index"
+                        log_info "Keeping level:1 deny entry at index $index for $username"
+                    else
+                        log_info "Removing duplicate level:1 deny entry at index $index for $username"
                         synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
                         # Update ACL after removal
                         current_acl=$(synoacltool -get "$folder_path")
                     fi
                 fi
             elif echo "$entry_line" | grep -q "level:2"; then
-                # Remove level:2 entries if we have level:0 or level:1 entries
-                if [ -n "$kept_level0_allow" ] || [ -n "$kept_level0_deny" ] || [ "$first_entry" = "false" ]; then
-                    log_info "Removing redundant level:2 entry at index $index for $username (overridden by higher priority)"
-                    synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                    # Update ACL after removal
-                    current_acl=$(synoacltool -get "$folder_path")
+                if echo "$entry_line" | grep -q ":allow:"; then
+                    if [ -z "$kept_level2_allow" ]; then
+                        kept_level2_allow="$index"
+                        log_info "Keeping level:2 allow entry at index $index for $username"
+                    else
+                        log_info "Removing duplicate level:2 allow entry at index $index for $username"
+                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
+                        # Update ACL after removal
+                        current_acl=$(synoacltool -get "$folder_path")
+                    fi
+                elif echo "$entry_line" | grep -q ":deny:"; then
+                    if [ -z "$kept_level2_deny" ]; then
+                        kept_level2_deny="$index"
+                        log_info "Keeping level:2 deny entry at index $index for $username"
+                    else
+                        log_info "Removing duplicate level:2 deny entry at index $index for $username"
+                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
+                        # Update ACL after removal
+                        current_acl=$(synoacltool -get "$folder_path")
+                    fi
                 fi
             fi
         done
@@ -369,8 +389,10 @@ sync_folder_permissions() {
     # Deny users who have inherited permissions but no database permissions
     deny_inherited_unauthorized_users "$folder_path" "$authorized_users"
     
-    # Remove conflicting deny rules from parent directories
-    remove_parent_deny_rules "$folder_path" "$authorized_users"
+    # Remove conflicting deny rules from current directory only
+    # This handles cases where explicit allow permissions conflict with deny rules
+    # During batch processing, we don't modify parent directories to avoid conflicts
+    remove_local_conflicting_deny_rules "$folder_path" "$authorized_users"
     
     # Ensure parent folder traversal permissions
     ensure_parent_traversal_permissions "$folder_path" "$authorized_users"
@@ -381,18 +403,103 @@ sync_folder_permissions() {
     log_info "Permission sync completed for folder ID: $folder_id"
 }
 
-# Function to remove conflicting deny rules from parent directories
-remove_parent_deny_rules() {
+# Function to remove conflicting deny rules from current directory and parent directories
+remove_local_conflicting_deny_rules() {
     local folder_path="$1"
     local authorized_users="$2"
     
     # Only proceed if we have authorized users (i.e., we're granting access)
     if [ -z "$authorized_users" ]; then
-        log_info "No authorized users for $folder_path - skipping parent deny rule cleanup"
+        log_info "No authorized users for $folder_path - skipping deny rule cleanup"
         return 0
     fi
     
-    log_info "Checking for conflicting deny rules in parent directories for: $folder_path"
+    log_info "Checking for conflicting deny rules for: $folder_path"
+    
+    # Process each authorized user
+    for user in $authorized_users; do
+        # Skip empty usernames
+        if [ -z "$user" ]; then continue; fi
+        
+        log_info "Checking for conflicting deny rules for user '$user'"
+        
+        # Step 1: Remove level:0 deny rules from current directory
+        remove_level0_deny_rules_from_directory "$folder_path" "$user"
+        
+        # Step 2: Check if user has inherited deny rules that would conflict
+        if has_inherited_deny_rule "$folder_path" "$user"; then
+            log_info "User '$user' has inherited deny rule - checking parent directories"
+            remove_parent_deny_rules_for_user "$folder_path" "$user"
+        fi
+    done
+}
+
+# Function to remove level:0 deny rules for a user from a specific directory
+remove_level0_deny_rules_from_directory() {
+    local target_path="$1"
+    local user="$2"
+    
+    # Check if directory has ACL
+    if ! synoacltool -get "$target_path" >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    # Keep removing level:0 deny rules until none are found
+    local removed_something=true
+    while [ "$removed_something" = true ]; do
+        removed_something=false
+        
+        # Get fresh ACL each time
+        local current_acl=$(synoacltool -get "$target_path" 2>/dev/null)
+        if [ -z "$current_acl" ]; then
+            break
+        fi
+        
+        # Find ONLY level:0 deny rules for this user
+        local deny_line=$(echo "$current_acl" | grep -n "user:$user:deny:" | grep "level:0" | head -1)
+        
+        if [ -n "$deny_line" ]; then
+            # Extract the ACL index from the bracketed number in the line
+            local acl_index=$(echo "$deny_line" | sed -n 's/.*\[\([0-9]\+\)\].*/\1/p')
+            
+            if [ -n "$acl_index" ]; then
+                log_info "Removing level:0 deny rule for user '$user' from '$target_path' at index $acl_index"
+                if synoacltool -del "$target_path" "$acl_index" >/dev/null 2>&1; then
+                    log_info "Successfully removed level:0 deny rule for user '$user' from '$target_path'"
+                    removed_something=true
+                else
+                    log_warn "Failed to remove level:0 deny rule for user '$user' from '$target_path'"
+                    break
+                fi
+            fi
+        fi
+    done
+}
+
+# Function to check if user has any inherited deny rules in current directory
+has_inherited_deny_rule() {
+    local folder_path="$1"
+    local user="$2"
+    
+    # Check if directory has ACL
+    if ! synoacltool -get "$folder_path" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # Check for any level > 0 deny rules for this user
+    local inherited_deny=$(synoacltool -get "$folder_path" 2>/dev/null | grep "user:$user:deny:" | grep -v "level:0")
+    
+    if [ -n "$inherited_deny" ]; then
+        return 0  # Has inherited deny rule
+    else
+        return 1  # No inherited deny rule
+    fi
+}
+
+# Function to remove deny rules from parent directories for a specific user
+remove_parent_deny_rules_for_user() {
+    local folder_path="$1"
+    local user="$2"
     
     # Get parent folder path (remove last component)
     local parent_path=$(dirname "$folder_path")
@@ -408,47 +515,13 @@ remove_parent_deny_rules() {
         return 0
     fi
     
-    # Process each authorized user
-    for user in $authorized_users; do
-        # Skip empty usernames
-        if [ -z "$user" ]; then continue; fi
-        
-        log_info "Checking for deny rules for user '$user' in parent '$parent_path'"
-        
-        # Keep removing deny rules until none are found (since indices change after each removal)
-        local removed_something=true
-        while [ "$removed_something" = true ]; do
-            removed_something=false
-            
-            # Get fresh ACL each time
-            local parent_acl=$(synoacltool -get "$parent_path" 2>/dev/null)
-            if [ -z "$parent_acl" ]; then
-                break
-            fi
-            
-            # Find level:0 deny rules for this user (only level:0, not inherited)
-            local deny_line=$(echo "$parent_acl" | grep -n "user:$user:deny:" | grep "level:0" | head -1)
-            
-            if [ -n "$deny_line" ]; then
-                # Extract the ACL index from the bracketed number in the line
-                local acl_index=$(echo "$deny_line" | sed -n 's/.*\[\([0-9]\+\)\].*/\1/p')
-                
-                if [ -n "$acl_index" ]; then
-                    log_info "Removing conflicting level:0 deny rule for user '$user' from parent '$parent_path' at index $acl_index"
-                    if synoacltool -del "$parent_path" "$acl_index" >/dev/null 2>&1; then
-                        log_info "Successfully removed deny rule for user '$user' from parent directory"
-                        removed_something=true
-                    else
-                        log_warn "Failed to remove deny rule for user '$user' from parent directory"
-                        break
-                    fi
-                fi
-            fi
-        done
-    done
+    log_info "Checking parent '$parent_path' for deny rules for user '$user'"
+    
+    # Remove level:0 deny rules from parent directory
+    remove_level0_deny_rules_from_directory "$parent_path" "$user"
     
     # Recursively check grandparent directories
-    remove_parent_deny_rules "$parent_path" "$authorized_users"
+    remove_parent_deny_rules_for_user "$parent_path" "$user"
 }
 
 # Function to ensure users can traverse parent folders to reach their authorized subfolder
