@@ -139,6 +139,34 @@ remove_unauthorized_users() {
     done
 }
 
+# Function to deny users who have inherited permissions but no database permissions
+deny_inherited_unauthorized_users() {
+    local folder_path=$1
+    local authorized_users=$2
+    
+    log_info "Checking for users with inherited permissions but no database access"
+    
+    # Get users with level:1 (inherited) allow permissions (excluding system users and admin group)
+    local inherited_users=$(synoacltool -get "$folder_path" | grep "user:.*:allow:.*level:1" | sed 's/.*user:\([^:]*\):.*/\1/' | grep -v -E "^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal)$")
+    
+    for user in $inherited_users; do
+        if ! echo "$authorized_users" | grep -q "\b$user\b"; then
+            # Check if user already has a level:0 entry (either allow or deny)
+            local existing_level0=$(synoacltool -get "$folder_path" | grep "user:$user:.*level:0")
+            if [ -z "$existing_level0" ]; then
+                log_info "User '$user' has inherited permissions but no database access - adding explicit deny rule"
+                # Add explicit deny rule at level:0 to override inherited allow at level:1
+                synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--"
+                if [ $? -eq 0 ]; then
+                    log_info "Successfully added deny rule for user $user"
+                else
+                    log_error "Failed to add deny rule for user $user"
+                fi
+            fi
+        fi
+    done
+}
+
 # Main function to sync permissions for a folder
 sync_folder_permissions() {
     local folder_id=$1
@@ -188,6 +216,9 @@ sync_folder_permissions() {
     
     # Remove unauthorized users
     remove_unauthorized_users "$folder_path" "$authorized_users"
+    
+    # Deny users who have inherited permissions but no database permissions
+    deny_inherited_unauthorized_users "$folder_path" "$authorized_users"
     
     log_info "Permission sync completed for folder ID: $folder_id"
 }
