@@ -181,6 +181,10 @@ run_summary_audit() {
     local missing_folders=0
     local total_mismatches=0
     
+    # Arrays to track problematic folders
+    local misaligned_folder_list=()
+    local missing_folder_list=()
+    
     # Process each shared folder silently
     while IFS='|' read -r folder_id folder_name; do
         if [ -z "$folder_id" ] || [ -z "$folder_name" ]; then continue; fi
@@ -190,6 +194,7 @@ run_summary_audit() {
         local folder_path=$(get_folder_path "$folder_name")
         if ! folder_exists "$folder_path"; then
             ((missing_folders++))
+            missing_folder_list+=("$folder_id|$folder_name")
             continue
         fi
         
@@ -225,6 +230,7 @@ run_summary_audit() {
             ((aligned_folders++))
         else
             ((misaligned_folders++))
+            misaligned_folder_list+=("$folder_id|$folder_name|$folder_mismatches")
             log_warn "Folder $folder_id ($folder_name): $folder_mismatches mismatches"
         fi
         
@@ -267,6 +273,36 @@ run_summary_audit() {
     echo
     local success_rate=$(( (aligned_folders * 100) / total_folders ))
     log_audit "Alignment Success Rate: $success_rate%"
+    
+    # Display detailed list of problematic folders
+    if [ "$misaligned_folders" -gt 0 ] || [ "$missing_folders" -gt 0 ]; then
+        echo
+        echo "======================================================" | tee -a "$LOG_FILE"
+        echo "           DETAILED LIST OF FOLDERS WITH ISSUES" | tee -a "$LOG_FILE"
+        echo "======================================================" | tee -a "$LOG_FILE"
+        
+        if [ "$misaligned_folders" -gt 0 ]; then
+            echo | tee -a "$LOG_FILE"
+            log_error "MISALIGNED FOLDERS ($misaligned_folders found):"
+            echo "ID   | Mismatches | Folder Name" | tee -a "$LOG_FILE"
+            echo "-----|------------|------------------------------------------" | tee -a "$LOG_FILE"
+            for folder_info in "${misaligned_folder_list[@]}"; do
+                IFS='|' read -r folder_id folder_name mismatch_count <<< "$folder_info"
+                printf "%-4s | %-10s | %s\n" "$folder_id" "$mismatch_count" "$folder_name" | tee -a "$LOG_FILE"
+            done
+        fi
+        
+        if [ "$missing_folders" -gt 0 ]; then
+            echo | tee -a "$LOG_FILE"
+            log_error "MISSING FOLDERS ($missing_folders found):"
+            echo "ID   | Folder Name" | tee -a "$LOG_FILE"
+            echo "-----|------------------------------------------" | tee -a "$LOG_FILE"
+            for folder_info in "${missing_folder_list[@]}"; do
+                IFS='|' read -r folder_id folder_name <<< "$folder_info"
+                printf "%-4s | %s\n" "$folder_id" "$folder_name" | tee -a "$LOG_FILE"
+            done
+        fi
+    fi
     
     # Return appropriate exit code
     if [ "$misaligned_folders" -eq 0 ] && [ "$missing_folders" -eq 0 ]; then
