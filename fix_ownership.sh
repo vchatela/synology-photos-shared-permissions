@@ -40,9 +40,9 @@ check_synology_photos_user() {
 
 # Function to find folders with orphaned ownership
 find_orphaned_folders() {
-    log_info "Scanning for folders with orphaned ownership (UID 138862)..."
+    log_info "Scanning for folders with orphaned ownership (UID 138862) at ALL levels..."
     
-    find "/volume1/photo" -maxdepth 1 -type d -uid 138862 2>/dev/null | while read folder; do
+    find "/volume1/photo" -type d -uid 138862 2>/dev/null | while read folder; do
         if [ "$folder" != "/volume1/photo" ]; then
             echo "$folder"
         fi
@@ -51,9 +51,9 @@ find_orphaned_folders() {
 
 # Function to find folders owned by admin that should be SynologyPhotos
 find_admin_owned_folders() {
-    log_info "Scanning for folders owned by admin that should be SynologyPhotos..."
+    log_info "Scanning for folders owned by admin that should be SynologyPhotos at ALL levels..."
     
-    find "/volume1/photo" -maxdepth 1 -type d -user admin 2>/dev/null | while read folder; do
+    find "/volume1/photo" -type d -user admin 2>/dev/null | while read folder; do
         if [ "$folder" != "/volume1/photo" ]; then
             echo "$folder"
         fi
@@ -160,15 +160,15 @@ show_ownership_summary() {
     log_info "Problematic folders:"
     
     # Orphaned UID 138862
-    local orphaned_count=$(find "/volume1/photo" -maxdepth 1 -type d -uid 138862 2>/dev/null | wc -l)
+    local orphaned_count=$(find "/volume1/photo" -type d -uid 138862 2>/dev/null | wc -l)
     echo "  Orphaned UID 138862: $orphaned_count folders"
     
     # Admin owned
-    local admin_count=$(find "/volume1/photo" -maxdepth 1 -type d -user admin 2>/dev/null | wc -l)
+    local admin_count=$(find "/volume1/photo" -type d -user admin 2>/dev/null | wc -l)
     echo "  Admin-owned: $admin_count folders"
     
     # SynologyPhotos owned (good)
-    local synology_count=$(find "/volume1/photo" -maxdepth 1 -type d -user SynologyPhotos 2>/dev/null | wc -l)
+    local synology_count=$(find "/volume1/photo" -type d -user SynologyPhotos 2>/dev/null | wc -l)
     echo "  SynologyPhotos-owned: $synology_count folders (correct)"
 }
 
