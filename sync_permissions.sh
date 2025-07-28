@@ -282,15 +282,15 @@ deny_inherited_unauthorized_users() {
     
     # Get users with level:1 (inherited) allow permissions (excluding system users and admin group)
     local inherited_users=$(synoacltool -get "$folder_path" | grep "user:.*:allow:.*level:1" | sed 's/.*user:\([^:]*\):.*/\1/' | grep -v -E "^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal)$")
-    log_info "Inherited users: [$inherited_users]"
+    log_info "Found inherited users: [$inherited_users]"
     
     for user in $inherited_users; do
         log_info "Checking user: $user"
         if ! echo "$authorized_users" | grep -q "\b$user\b"; then
-            log_info "User '$user' is NOT in authorized list - will add deny rule"
-            # Check if user already has a level:0 entry (either allow or deny)
-            local existing_level0=$(synoacltool -get "$folder_path" | grep "user:$user:.*level:0")
-            if [ -z "$existing_level0" ]; then
+            log_info "User '$user' is NOT in authorized list - checking for level:0 deny rule"
+            # Check if user already has a level:0 deny entry
+            local existing_level0_deny=$(synoacltool -get "$folder_path" | grep "user:$user:deny:.*level:0")
+            if [ -z "$existing_level0_deny" ]; then
                 log_info "User '$user' has inherited permissions but no database access - adding explicit deny rule"
                 # Add explicit deny rule at level:0 to override inherited allow at level:1
                 synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--"
@@ -300,10 +300,15 @@ deny_inherited_unauthorized_users() {
                     log_error "Failed to add deny rule for user $user"
                 fi
             else
-                log_info "User '$user' already has level:0 rule, skipping deny"
+                log_info "User '$user' already has level:0 deny rule, no action needed"
             fi
         else
-            log_info "User '$user' IS in authorized list - skipping deny rule"
+            log_info "User '$user' IS in authorized list - ensuring no deny rule blocks access"
+            # Check if user has a level:0 deny rule that would block their authorized access
+            local existing_level0_deny=$(synoacltool -get "$folder_path" | grep "user:$user:deny:.*level:0")
+            if [ -n "$existing_level0_deny" ]; then
+                log_warn "User '$user' is authorized but has level:0 deny rule - this should be reviewed"
+            fi
         fi
     done
 }
@@ -381,6 +386,12 @@ remove_parent_deny_rules() {
     local folder_path="$1"
     local authorized_users="$2"
     
+    # Only proceed if we have authorized users (i.e., we're granting access)
+    if [ -z "$authorized_users" ]; then
+        log_info "No authorized users for $folder_path - skipping parent deny rule cleanup"
+        return 0
+    fi
+    
     log_info "Checking for conflicting deny rules in parent directories for: $folder_path"
     
     # Get parent folder path (remove last component)
@@ -399,6 +410,9 @@ remove_parent_deny_rules() {
     
     # Process each authorized user
     for user in $authorized_users; do
+        # Skip empty usernames
+        if [ -z "$user" ]; then continue; fi
+        
         log_info "Checking for deny rules for user '$user' in parent '$parent_path'"
         
         # Keep removing deny rules until none are found (since indices change after each removal)
@@ -412,7 +426,7 @@ remove_parent_deny_rules() {
                 break
             fi
             
-            # Find level:0 deny rules for this user
+            # Find level:0 deny rules for this user (only level:0, not inherited)
             local deny_line=$(echo "$parent_acl" | grep -n "user:$user:deny:" | grep "level:0" | head -1)
             
             if [ -n "$deny_line" ]; then
@@ -420,7 +434,7 @@ remove_parent_deny_rules() {
                 local acl_index=$(echo "$deny_line" | sed -n 's/.*\[\([0-9]\+\)\].*/\1/p')
                 
                 if [ -n "$acl_index" ]; then
-                    log_info "Removing conflicting deny rule for user '$user' from parent '$parent_path' at index $acl_index"
+                    log_info "Removing conflicting level:0 deny rule for user '$user' from parent '$parent_path' at index $acl_index"
                     if synoacltool -del "$parent_path" "$acl_index" >/dev/null 2>&1; then
                         log_info "Successfully removed deny rule for user '$user' from parent directory"
                         removed_something=true
