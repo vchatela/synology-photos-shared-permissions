@@ -111,7 +111,30 @@ And here was the source:
 ![Reverse Engineer overview](synofoto.drawio.png)
 
 ## How to apply those permissions to Filesytem (used for SAMBA/SMB etc.)
-[In progress]
+
+✅ **COMPLETED** - See `IMPLEMENTATION_SUMMARY.md` for full details.
+
+The solution has been implemented with two main scripts:
+
+### `sync_permissions.sh`
+Synchronizes filesystem ACLs with database permissions. Usage:
+```bash
+./sync_permissions.sh [FOLDER_ID]
+```
+
+### `validate_permissions.sh` 
+Validates that permissions are correctly applied. Usage:
+```bash
+./validate_permissions.sh [FOLDER_ID]
+```
+
+**Key Features:**
+- Read-only access alignment (no write permissions granted via filesystem)
+- Automatic user management based on database permissions
+- Safe ACL handling that preserves system rules
+- Full validation and logging
+
+**Tested and validated** with folder ID 92 ("/Scans").
 
 ## Conclusion
 
