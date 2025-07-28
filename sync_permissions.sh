@@ -145,12 +145,16 @@ deny_inherited_unauthorized_users() {
     local authorized_users=$2
     
     log_info "Checking for users with inherited permissions but no database access"
+    log_info "Authorized users: [$authorized_users]"
     
     # Get users with level:1 (inherited) allow permissions (excluding system users and admin group)
     local inherited_users=$(synoacltool -get "$folder_path" | grep "user:.*:allow:.*level:1" | sed 's/.*user:\([^:]*\):.*/\1/' | grep -v -E "^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal)$")
+    log_info "Inherited users: [$inherited_users]"
     
     for user in $inherited_users; do
+        log_info "Checking user: $user"
         if ! echo "$authorized_users" | grep -q "\b$user\b"; then
+            log_info "User '$user' is NOT in authorized list - will add deny rule"
             # Check if user already has a level:0 entry (either allow or deny)
             local existing_level0=$(synoacltool -get "$folder_path" | grep "user:$user:.*level:0")
             if [ -z "$existing_level0" ]; then
@@ -162,7 +166,11 @@ deny_inherited_unauthorized_users() {
                 else
                     log_error "Failed to add deny rule for user $user"
                 fi
+            else
+                log_info "User '$user' already has level:0 rule, skipping deny"
             fi
+        else
+            log_info "User '$user' IS in authorized list - skipping deny rule"
         fi
     done
 }
@@ -188,39 +196,74 @@ sync_folder_permissions() {
     
     if [ -z "$permissions" ]; then
         log_warn "No permissions found in database for folder ID $folder_id"
-        return 1
+        local authorized_users=""
+    else
+        log_info "Database permissions found:"
+        local temp_file="/tmp/permissions.tmp"
+        echo "$permissions" > "$temp_file"
+        while IFS=: read -r username perm; do
+            if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
+                log_info "  User: $username, DB Permission: $perm -> Will get READ-ONLY filesystem access"
+            fi
+        done < "$temp_file"
+        rm -f "$temp_file"
+        
+        # Get list of authorized users
+        local authorized_users=$(echo "$permissions" | cut -d: -f1 | tr '\n' ' ')
+        
+        # Apply permissions for each user
+        local temp_file="/tmp/permissions.tmp"
+        echo "$permissions" > "$temp_file"
+        while IFS=: read -r username perm; do
+            if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
+                apply_acl_permissions "$folder_path" "$username" "$perm"
+            fi
+        done < "$temp_file"
+        rm -f "$temp_file"
+        
+        # Remove unauthorized users
+        remove_unauthorized_users "$folder_path" "$authorized_users"
     fi
-    
-    log_info "Database permissions found:"
-    local temp_file="/tmp/permissions.tmp"
-    echo "$permissions" > "$temp_file"
-    while IFS=: read -r username perm; do
-        if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
-            log_info "  User: $username, DB Permission: $perm -> Will get READ-ONLY filesystem access"
-        fi
-    done < "$temp_file"
-    rm -f "$temp_file"
-    
-    # Get list of authorized users
-    local authorized_users=$(echo "$permissions" | cut -d: -f1 | tr '\n' ' ')
-    
-    # Apply permissions for each user
-    local temp_file="/tmp/permissions.tmp"
-    echo "$permissions" > "$temp_file"
-    while IFS=: read -r username perm; do
-        if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
-            apply_acl_permissions "$folder_path" "$username" "$perm"
-        fi
-    done < "$temp_file"
-    rm -f "$temp_file"
-    
-    # Remove unauthorized users
-    remove_unauthorized_users "$folder_path" "$authorized_users"
     
     # Deny users who have inherited permissions but no database permissions
     deny_inherited_unauthorized_users "$folder_path" "$authorized_users"
     
+    # Ensure parent folder traversal permissions
+    ensure_parent_traversal_permissions "$folder_path" "$authorized_users"
+    
     log_info "Permission sync completed for folder ID: $folder_id"
+}
+
+# Function to ensure users can traverse parent folders to reach their authorized subfolder
+ensure_parent_traversal_permissions() {
+    local folder_path="$1"
+    local authorized_users="$2"
+    
+    log_info "Checking parent folder traversal permissions for: $folder_path"
+    
+    # Get parent folder path (remove last component)
+    local parent_path=$(dirname "$folder_path")
+    
+    # Skip if already at photo root
+    if [ "$parent_path" = "/volume1/photo" ] || [ "$parent_path" = "/volume1" ]; then
+        return 0
+    fi
+    
+    # Check each authorized user
+    for username in $authorized_users; do
+        # Skip system users
+        if [[ "$username" =~ ^(guest|admin|root|chef|temp_adm)$ ]]; then
+            continue
+        fi
+        
+        # Test if user can access parent folder
+        if ! sudo -u "$username" test -x "$parent_path" 2>/dev/null; then
+            log_info "User '$username' cannot traverse parent '$parent_path', granting minimal traversal permissions"
+            
+            # Grant minimal traversal permission (execute only) to parent folder
+            synoacltool -add "$parent_path" "user:$username:allow:--x----------:fd--" 2>/dev/null || true
+        fi
+    done
 }
 
 # Function to validate setup

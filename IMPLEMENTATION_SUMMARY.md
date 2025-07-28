@@ -102,6 +102,48 @@ local folder_name=$(psql -t -A -c "SELECT name FROM folder WHERE id = $id;")
 - Users with inherited permissions but no database access (need explicit deny)
 - Users with database permissions but no filesystem access (need explicit allow)
 - ACL inheritance issues where level:1 rules don't override base permissions
+- **Parent folder traversal permission issues** (users need execute permissions on all parent directories)
+
+## Critical Bug Fixes
+
+### Database Query Whitespace Trimming Bug (CRITICAL)
+**Issue**: PostgreSQL query with `xargs` was trimming multiple consecutive spaces from folder names.
+
+**Manifestation**: Folders with names like "Concert Jaïn  - 11-05-19" (double space) were queried as "Concert Jaïn - 11-05-19" (single space), causing "folder not found" errors.
+
+**Root Cause**: The `xargs` command automatically collapses whitespace, but the database stores exact folder names with multiple spaces.
+
+**Fix**: Replaced `psql -t | xargs` with `psql -t -A` across all scripts:
+- `permission_audit.sh`: Fixed `audit_single_folder()` and `get_folder_path()`  
+- `sync_permissions.sh`: Fixed `get_folder_path()`
+- `batch_sync.sh`: Fixed `get_folder_name()`
+
+**Impact**: Critical for folders with complex naming patterns containing multiple consecutive spaces.
+
+### Parent Folder Traversal Permission Issue (CRITICAL)
+**Issue**: Users with database permissions to subfolders could not access them due to lack of traversal permissions on parent folders.
+
+**Root Cause**: 
+- Unix/Linux filesystems require execute permissions on ALL parent directories to access subdirectories
+- Database allows subfolder permissions without parent folder permissions
+- Explicit deny rules on parent folders override allow rules on subfolders due to ACL inheritance
+
+**Manifestation**:
+- Audit showed "Has DB permission but FS DENIED" for users with subfolder access
+- Users could not traverse parent directories even with subfolder permissions
+- Deny rules at level:0 on parent folders became level:1 inherited rules on subfolders
+
+**Technical Fix**: Enhanced `sync_permissions.sh` with `ensure_parent_traversal_permissions()` function:
+- Automatically detects when authorized users cannot traverse parent folders
+- Grants minimal execute-only permissions (`--x----------`) to parent folders
+- Uses correct synoacltool syntax: `"user:username:allow:--x----------:fd--"`
+
+**Manual Resolution Required**: 
+- Removed conflicting explicit deny rules from parent folders
+- ACL precedence: deny rules override allow rules regardless of level
+- Example: `/volume1/photo/CDs` had deny rules for famille/mathilde preventing `/volume1/photo/CDs/FullSize` access
+
+**Impact**: Resolves fundamental filesystem access issues for hierarchical folder structures with complex permission inheritance.
 
 ### 7. Current ACL Structure
 
