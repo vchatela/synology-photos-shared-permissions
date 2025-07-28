@@ -48,16 +48,16 @@ get_acl_permissions() {
 # Function to query database for folder permissions
 get_folder_permissions() {
     local folder_id=$1
-    log_info "Querying database for folder ID: $folder_id"
     
     # Connect to postgres and run the query - get actual usernames, not UIDs
+    # Use 2>/dev/null to suppress any postgres connection messages
     su - postgres -c "psql -d synofoto -t -A -F: -c \"
 SELECT ui.name, sp.permission
 FROM share_permission sp
 JOIN user_info ui ON sp.target_id = ui.id
 JOIN folder f ON f.passphrase_share = sp.passphrase_share
 WHERE f.id = $folder_id AND sp.target_id != 0 AND sp.permission > 0;
-\"" | grep -v "^$"
+\"" 2>/dev/null | grep -v "^$"
 }
 
 # Function to get folder path from database
@@ -92,11 +92,14 @@ apply_acl_permissions() {
     
     log_info "Setting ACL for user '$username' with permissions '$acl_perms' on '$folder_path'"
     
-    # Remove existing ACL for this user first (if any)
-    local existing_index=$(synoacltool -get "$folder_path" | grep "user:$username:" | sed 's/.*\[\([0-9]*\)\].*/\1/')
-    if [ ! -z "$existing_index" ]; then
-        log_info "Removing existing ACL entry at index $existing_index for user $username"
-        synoacltool -del "$folder_path" "$existing_index"
+    # Remove existing ACL for this user first (only level:0 entries to avoid inherited entry conflicts)
+    local existing_indices=$(synoacltool -get "$folder_path" | grep "user:$username:.*level:0" | sed 's/.*\[\([0-9]*\)\].*/\1/')
+    if [ ! -z "$existing_indices" ]; then
+        # Remove in reverse order to maintain index validity
+        for index in $(echo "$existing_indices" | sort -nr); do
+            log_info "Removing existing level:0 ACL entry at index $index for user $username"
+            synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Could not remove ACL entry at index $index (may be inherited)"
+        done
     fi
     
     # Add new ACL entry
@@ -117,15 +120,19 @@ remove_unauthorized_users() {
     
     log_info "Checking for unauthorized users on '$folder_path'"
     
-    # Get current ACL users (excluding system deny rules and administrators group)
-    local current_users=$(synoacltool -get "$folder_path" | grep "user:.*:allow:" | sed 's/.*user:\([^:]*\):.*/\1/' | grep -v -E "^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal)$")
+    # Get current ACL users from level:0 only (excluding system deny rules and administrators group)
+    local current_users=$(synoacltool -get "$folder_path" | grep "user:.*:allow:.*level:0" | sed 's/.*user:\([^:]*\):.*/\1/' | grep -v -E "^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal)$")
     
     for user in $current_users; do
         if ! echo "$authorized_users" | grep -q "\b$user\b"; then
             log_warn "User '$user' not authorized according to database, removing access"
-            local user_index=$(synoacltool -get "$folder_path" | grep "user:$user:allow:" | sed 's/.*\[\([0-9]*\)\].*/\1/')
-            if [ ! -z "$user_index" ]; then
-                synoacltool -del "$folder_path" "$user_index"
+            # Get all level:0 indices for this user
+            local user_indices=$(synoacltool -get "$folder_path" | grep "user:$user:allow:.*level:0" | sed 's/.*\[\([0-9]*\)\].*/\1/')
+            if [ ! -z "$user_indices" ]; then
+                # Remove in reverse order to maintain index validity
+                for index in $(echo "$user_indices" | sort -nr); do
+                    synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Could not remove ACL entry at index $index (may be inherited)"
+                done
                 log_info "Removed ACL entry for unauthorized user $user"
             fi
         fi
@@ -148,6 +155,7 @@ sync_folder_permissions() {
     fi
     
     # Get permissions from database
+    log_info "Querying database for folder permissions..."
     local permissions=$(get_folder_permissions $folder_id)
     
     if [ -z "$permissions" ]; then
