@@ -1,11 +1,16 @@
 #!/bin/bash
 
 # Extended Test Script for Synology Photos Permission Synchronization
-# This script tests folder IDs 1-50 with sync and audit operations
+# This script tests shared folders with sync and audit operations
 #
 # Usage: ./extended_test.sh [start_id] [end_id]
-# Example: ./extended_test.sh 1 50
-# Example: ./extended_test.sh 10 20  (test only IDs 10-20)
+# Examples: 
+#   ./extended_test.sh                    # Smart filtering - test all shared folders (recommended)
+#   ./extended_test.sh 1 50               # Range mode - test shared folders with IDs 1-50 only
+#   ./extended_test.sh 10 20              # Range mode - test shared folders with IDs 10-20 only
+#
+# Note: Range mode still applies smart filtering (only shared folders with permissions)
+#       but limits the search to the specified ID range.
 
 # Color output for better readability
 RED='\033[0;31m'
@@ -36,6 +41,44 @@ log_section() {
 
 log_subsection() {
     echo -e "${CYAN}--- $1 ---${NC}"
+}
+
+# Function to get all shared folder IDs from database (inspired by batch_sync.sh)
+get_shared_folder_ids() {
+    local start_range=${1:-0}
+    local end_range=${2:-0}
+    
+    echo "Querying database for shared folders..." >&2
+    
+    # Build the query with optional range filtering
+    local range_filter=""
+    if [ "$start_range" -gt 0 ] && [ "$end_range" -gt 0 ]; then
+        range_filter="AND f.id >= $start_range AND f.id <= $end_range"
+        echo "Applying range filter: IDs $start_range to $end_range" >&2
+    fi
+    
+    # Get folder IDs that have share permissions and exist on filesystem
+    # Filter for folders that:
+    # 1. Have share permissions (share_permission table)
+    # 2. Are not the root folder (id != 1)
+    # 3. Have meaningful names (not empty, not just "/")
+    # 4. Exclude system/temporary folders
+    # 5. Optional: within specified range
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT DISTINCT f.id 
+FROM folder f
+JOIN share_permission sp ON f.passphrase_share = sp.passphrase_share
+WHERE f.id > 1 
+  AND f.name IS NOT NULL 
+  AND f.name != '/' 
+  AND f.name != ''
+  AND f.name NOT LIKE '%#recycle%'
+  AND f.name NOT LIKE '%@eaDir%'
+  AND f.name NOT LIKE '%.__%'
+  AND sp.permission > 0
+  $range_filter
+ORDER BY f.id;
+" 2>/dev/null | grep -E '^[0-9]+$'
 }
 
 # Function to check if folder exists in database
@@ -156,11 +199,17 @@ generate_summary() {
     
     log_section "EXTENDED TEST SUMMARY REPORT"
     
-    echo "Test Range: Folder IDs $start_id to $end_id"
-    echo "Total Folders Processed: $total_processed"
+    if [ "$start_id" = "smart_filter" ]; then
+        echo "Test Mode: Smart filtering (shared folders with permissions only)"
+        echo "Total Folders Found: $total_processed"
+    else
+        echo "Test Range: Folder IDs $start_id to $end_id"
+        echo "Total Folders Processed: $total_processed"
+        echo "Skipped (non-existent): $total_skipped"
+    fi
+    
     echo "Successfully Synced: $total_synced"
     echo "Successfully Audited: $total_audited"
-    echo "Skipped (non-existent): $total_skipped"
     echo "Errors: $total_errors"
     echo ""
     
@@ -202,26 +251,69 @@ generate_summary() {
 
 # Main execution
 main() {
-    local start_id=${1:-1}    # Default start at ID 1
-    local end_id=${2:-50}     # Default end at ID 50
+    local start_id=${1:-0}    # Default start at ID 0 (means use smart filtering)
+    local end_id=${2:-0}      # Default end at ID 0 (means use smart filtering)
+    local use_smart_filter=true
     
-    # Validate inputs
-    if ! [[ "$start_id" =~ ^[0-9]+$ ]] || ! [[ "$end_id" =~ ^[0-9]+$ ]]; then
-        log_error "Invalid input: start_id and end_id must be numbers"
-        echo "Usage: $0 [start_id] [end_id]"
-        echo "Example: $0 1 50"
-        exit 1
-    fi
-    
-    if [ "$start_id" -gt "$end_id" ]; then
-        log_error "start_id ($start_id) cannot be greater than end_id ($end_id)"
-        exit 1
+    # If both start_id and end_id are provided and > 0, use range mode
+    if [ "$start_id" -gt 0 ] && [ "$end_id" -gt 0 ]; then
+        use_smart_filter=false
+        
+        # Validate inputs for range mode
+        if ! [[ "$start_id" =~ ^[0-9]+$ ]] || ! [[ "$end_id" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid input: start_id and end_id must be numbers"
+            echo "Usage: $0 [start_id] [end_id]"
+            echo "       $0                    # Use smart filtering (recommended)"
+            echo "       $0 1 50               # Test shared folders with IDs 1-50"
+            exit 1
+        fi
+        
+        if [ "$start_id" -gt "$end_id" ]; then
+            log_error "start_id ($start_id) cannot be greater than end_id ($end_id)"
+            exit 1
+        fi
     fi
     
     log_section "EXTENDED PERMISSION SYNC & AUDIT TEST"
-    echo "Testing folder IDs: $start_id to $end_id"
-    echo "Started at: $(date)"
-    echo ""
+    
+    if [ "$use_smart_filter" = true ]; then
+        echo "Using smart filtering (shared folders with permissions only)"
+        echo "Started at: $(date)"
+        echo ""
+        
+        # Get shared folder IDs from database
+        log_info "Getting shared folder IDs from database..."
+        local folder_ids_list
+        folder_ids_list=$(get_shared_folder_ids)
+        
+        if [ -z "$folder_ids_list" ]; then
+            log_error "No shared folders found in database"
+            exit 1
+        fi
+        
+        # Convert to array
+        local folder_ids_array=($folder_ids_list)
+        log_info "Found ${#folder_ids_array[@]} shared folders to test"
+        
+    else
+        echo "Testing folder IDs: $start_id to $end_id (range mode with smart filtering)"
+        echo "Started at: $(date)"
+        echo ""
+        
+        # Get shared folder IDs from database within the specified range
+        log_info "Getting shared folder IDs from database (range: $start_id to $end_id)..."
+        local folder_ids_list
+        folder_ids_list=$(get_shared_folder_ids "$start_id" "$end_id")
+        
+        if [ -z "$folder_ids_list" ]; then
+            log_error "No shared folders found in database within range $start_id to $end_id"
+            exit 1
+        fi
+        
+        # Convert to array
+        local folder_ids_array=($folder_ids_list)
+        log_info "Found ${#folder_ids_array[@]} shared folders to test within range"
+    fi
     
     # Check if required scripts exist
     if [ ! -f "./sync_permissions.sh" ]; then
@@ -246,15 +338,8 @@ main() {
     local total_errors=0
     
     # Process each folder ID
-    for ((folder_id=start_id; folder_id<=end_id; folder_id++)); do
+    for folder_id in "${folder_ids_array[@]}"; do
         log_section "PROCESSING FOLDER ID: $folder_id"
-        
-        # Check if folder exists in database
-        if ! folder_exists_in_db "$folder_id"; then
-            log_warn "Folder ID $folder_id does not exist in database - skipping"
-            ((total_skipped++))
-            continue
-        fi
         
         ((total_processed++))
         
@@ -279,7 +364,11 @@ main() {
     done
     
     # Generate final summary
-    generate_summary "$start_id" "$end_id" "$total_processed" "$total_synced" "$total_audited" "$total_skipped" "$total_errors"
+    if [ "$use_smart_filter" = true ]; then
+        generate_summary "smart_filter" "smart_filter" "$total_processed" "$total_synced" "$total_audited" "$total_skipped" "$total_errors"
+    else
+        generate_summary "$start_id" "$end_id" "$total_processed" "$total_synced" "$total_audited" "$total_skipped" "$total_errors"
+    fi
     
     echo "Completed at: $(date)"
     log_info "Extended test completed!"

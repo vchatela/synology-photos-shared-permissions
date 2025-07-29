@@ -611,6 +611,23 @@ process_folder_for_user() {
         return 0
     fi
     
+    # Check if user already has a level:0 allow rule with better permissions
+    local existing_allow=$(echo "$current_acl" | grep "user:$user:allow:.*level:0")
+    local has_read_permission=false
+    
+    if [ -n "$existing_allow" ]; then
+        # Check if existing permission includes read (r-x---aARWc--)
+        if echo "$existing_allow" | grep -q "r-x---aARWc--"; then
+            has_read_permission=true
+        fi
+    fi
+    
+    # Don't downgrade from full read access to traversal-only
+    if [ "$permission_type" = "traversal" ] && [ "$has_read_permission" = true ]; then
+        log_info "User '$user' already has read access - not downgrading to traversal-only"
+        return 0
+    fi
+    
     # STEP 1: Remove ALL existing level:0 entries for this user (clean slate)
     local existing_level0_indices=$(echo "$current_acl" | grep -n "user:$user:.*level:0" | sed 's/\([0-9]*\):.*\[\([0-9]*\)\].*/\2/' | sort -nr)
     
