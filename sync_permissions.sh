@@ -203,20 +203,20 @@ cleanup_acl_duplicates() {
             current_acl=$(synoacltool -get "$folder_path")
         fi
         
-        # Check for duplicate level:1 allow entries
-        local level1_allow_entries=$(echo "$current_acl" | grep "user:$username:allow:" | grep "level:1" 2>/dev/null || echo "")
-        local level1_allow_count=$(echo "$level1_allow_entries" | wc -l)
+        # Check for duplicate level:0 deny entries
+        local level0_deny_entries=$(echo "$current_acl" | grep "user:$username:deny:" | grep "level:0" 2>/dev/null || echo "")
+        local level0_deny_count=$(echo "$level0_deny_entries" | wc -l)
         
-        # Handle empty case properly
-        if [ -z "$level1_allow_entries" ]; then
-            level1_allow_count=0
+        # Handle empty case properly  
+        if [ -z "$level0_deny_entries" ]; then
+            level0_deny_count=0
         fi
         
-        if [ "$level1_allow_count" -gt 1 ]; then
-            log_warn "Found $level1_allow_count level:1 allow entries for $username - removing extras"
-            local indices_to_remove=$(echo "$level1_allow_entries" | tail -n +2 | sed 's/.*\[\([0-9]*\)\].*/\1/' | sort -nr)
+        if [ "$level0_deny_count" -gt 1 ]; then
+            log_warn "Found $level0_deny_count level:0 deny entries for $username - removing extras"
+            local indices_to_remove=$(echo "$level0_deny_entries" | tail -n +2 | sed 's/.*\[\([0-9]*\)\].*/\1/' | sort -nr)
             for index in $indices_to_remove; do
-                log_info "Removing duplicate level:1 allow entry at index $index for $username"
+                log_info "Removing duplicate level:0 deny entry at index $index for $username"
                 synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
             done
             # Refresh ACL after changes
@@ -406,27 +406,40 @@ sync_folder_permissions() {
         
         # Get list of authorized users
         local authorized_users=$(echo "$permissions" | cut -d: -f1 | tr '\n' ' ')
+        
+        # Apply permissions for each user
+        local temp_file="/tmp/permissions.tmp"
+        echo "$permissions" > "$temp_file"
+        while IFS=: read -r username perm; do
+            if [ ! -z "$username" ] && [ ! -z "$perm" ]; then
+                apply_acl_permissions "$folder_path" "$username" "$perm"
+                # Ensure parent traversal permissions for this user
+                replace_parent_deny_with_execute "$folder_path" "$username"
+            fi
+        done < "$temp_file"
+        rm -f "$temp_file"
     fi
     
-    # STEP 1: Process ALL system users - authorized users get access, others get denied
+    # Get all users and add explicit deny rules for unauthorized users
     local all_users=$(get_all_system_users)
     for user in $all_users; do
+        # Skip if user is authorized
+        if echo "$authorized_users" | grep -q "\b$user\b"; then
+            continue
+        fi
+        
         # Skip system users that shouldn't be modified
         if [[ "$user" =~ ^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal|guest|admin|root|chef)$ ]]; then
             continue
         fi
         
-        # Check if user is authorized
-        if echo "$authorized_users" | grep -q "\b$user\b"; then
-            log_info "User '$user' is authorized - ensuring access path"
-            ensure_user_access_path "$folder_path" "$user" "yes"
-        else
-            log_info "User '$user' is NOT authorized - ensuring denial"
-            ensure_user_access_path "$folder_path" "$user" "no"
-        fi
+        # Add explicit deny rule for unauthorized users
+        # Note: These may be removed later by child folder processing if traversal access is needed
+        log_info "Adding explicit deny rule for unauthorized user '$user'"
+        synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--" 2>/dev/null || true
     done
     
-    # STEP 2: Clean up any remaining duplicate ACL entries
+    # Clean up duplicate ACL entries
     cleanup_acl_duplicates "$folder_path"
     
     log_info "Permission sync completed for folder ID: $folder_id"
@@ -526,134 +539,80 @@ has_inherited_deny_rule() {
     fi
 }
 
-# Function to ensure user can traverse to their authorized folder by removing ALL blocking deny rules
-# This function processes ALL parent directories FIRST, then the target folder
-ensure_user_access_path() {
+# Function to replace parent deny rules with execute-only permissions for a specific user
+replace_parent_deny_with_execute() {
     local folder_path="$1"
     local user="$2"
-    local has_permission="$3"  # "yes" if user should have access, "no" if they shouldn't
     
-    log_info "Ensuring access path for user '$user' to '$folder_path' (permission: $has_permission)"
+    # Get parent folder path (remove last component)
+    local parent_path=$(dirname "$folder_path")
     
-    # If user shouldn't have access, just deny them everywhere and return
-    if [ "$has_permission" = "no" ]; then
-        process_folder_for_user "$folder_path" "$user" "no"
+    # Don't process if we've reached the root photo directory
+    if [ "$parent_path" = "/volume1/photo" ] || [ "$parent_path" = "/" ]; then
         return 0
     fi
     
-    # Build list of all paths from /volume1/photo down to target folder
-    local paths_to_process=()
-    local current_path="$folder_path"
+    # Check if parent directory has ACL
+    if ! synoacltool -get "$parent_path" >/dev/null 2>&1; then
+        log_info "Parent directory $parent_path has no ACL, skipping"
+        return 0
+    fi
     
-    # Build the path list (target to root)
-    while true; do
-        paths_to_process=("$current_path" "${paths_to_process[@]}")
-        local parent_path=$(dirname "$current_path")
-        
-        # Stop if we've reached above the photo directory
-        if [ "$parent_path" = "/volume1" ] || [ "$parent_path" = "/" ]; then
-            break
+    # Check if user has database permission for parent - if yes, don't change anything
+    local parent_folder_id=$(get_folder_id_from_path "$parent_path")
+    if [ -n "$parent_folder_id" ]; then
+        if user_has_database_permission "$parent_folder_id" "$user"; then
+            log_info "User '$user' has database permission for parent '$parent_path' - no need to change"
+            return 0
         fi
-        
-        current_path="$parent_path"
-    done
+    fi
     
-    # Process all paths from root to target (parents first!)
-    for path_to_process in "${paths_to_process[@]}"; do
-        # Check if directory exists and has ACL
-        if [ ! -d "$path_to_process" ] || ! synoacltool -get "$path_to_process" >/dev/null 2>&1; then
-            log_info "Directory $path_to_process does not exist or has no ACL, skipping"
-            continue
-        fi
+    log_info "User '$user' needs traversal access to parent '$parent_path' but no database permission - replacing deny with execute-only"
+    
+    # Get fresh ACL
+    local parent_acl=$(synoacltool -get "$parent_path" 2>/dev/null)
+    
+    # Find and remove ALL deny rules for this user (level:0, level:1, level:2, etc.)
+    # because deny rules block access to ALL child folders
+    local all_deny_entries=$(echo "$parent_acl" | grep "user:$user:deny:")
+    
+    if [ -n "$all_deny_entries" ]; then
+        log_info "Found deny rules for user '$user' in parent - removing all to prevent child folder blocking"
         
-        # Determine what permission this user should have for this specific folder
-        local path_permission="no"
+        # Remove all deny rules in reverse order to maintain index validity
+        local deny_indices=$(echo "$parent_acl" | grep -n "user:$user:deny:" | sed 's/\([0-9]*\):.*\[\([0-9]*\)\].*/\2/' | sort -nr)
         
-        # Check if user has database permission for this specific folder
-        local path_folder_id=$(get_folder_id_from_path "$path_to_process")
-        if [ -n "$path_folder_id" ]; then
-            if user_has_database_permission "$path_folder_id" "$user"; then
-                path_permission="yes"
-                log_info "User '$user' has database permission for '$path_to_process'"
+        for acl_index in $deny_indices; do
+            log_info "Removing deny rule at index $acl_index from parent '$parent_path'"
+            if synoacltool -del "$parent_path" "$acl_index" 2>/dev/null; then
+                log_info "Successfully removed deny rule for user '$user' at index $acl_index"
             else
-                log_info "User '$user' has no database permission for '$path_to_process'"
-                # If this is not the target folder, but user needs access to target, grant traversal
-                if [ "$path_to_process" != "$folder_path" ]; then
-                    path_permission="traversal"
-                    log_info "User '$user' needs traversal access through '$path_to_process'"
-                fi
+                log_warn "Failed to remove deny rule at index $acl_index"
             fi
-        else
-            log_info "Folder '$path_to_process' not found in database"
-            # If this is not the target folder, but user needs access to target, grant traversal
-            if [ "$path_to_process" != "$folder_path" ]; then
-                path_permission="traversal"
-                log_info "User '$user' needs traversal access through '$path_to_process'"
-            fi
-        fi
+            # Refresh ACL after each deletion
+            parent_acl=$(synoacltool -get "$parent_path" 2>/dev/null)
+        done
         
-        # Process this folder
-        process_folder_for_user "$path_to_process" "$user" "$path_permission"
-    done
-}
-
-# Function to process a single folder for a user - clean approach
-process_folder_for_user() {
-    local folder_path="$1"
-    local user="$2" 
-    local permission_type="$3"  # "yes", "no", or "traversal"
-    
-    log_info "Processing folder '$folder_path' for user '$user' with permission '$permission_type'"
-    
-    # Get current ACL
-    local current_acl=$(synoacltool -get "$folder_path" 2>/dev/null)
-    if [ -z "$current_acl" ]; then
-        return 0
-    fi
-    
-    # Check if user already has a level:0 allow rule with better permissions
-    local existing_allow=$(echo "$current_acl" | grep "user:$user:allow:.*level:0")
-    local has_read_permission=false
-    
-    if [ -n "$existing_allow" ]; then
-        # Check if existing permission includes read (r-x---aARWc--)
-        if echo "$existing_allow" | grep -q "r-x---aARWc--"; then
-            has_read_permission=true
+        # Add execute-only permission for traversal (but not read)
+        log_info "Adding execute-only permission for user '$user' on parent '$parent_path'"
+        if synoacltool -add "$parent_path" "user:$user:allow:--x----------:fd--" 2>/dev/null; then
+            log_info "Successfully added execute-only permission for traversal"
+        else
+            log_warn "Failed to add execute permission"
+        fi
+    else
+        # No deny rules found, but check if user has any access at all
+        local any_allow_entries=$(echo "$parent_acl" | grep "user:$user:allow:")
+        if [ -z "$any_allow_entries" ]; then
+            log_info "User '$user' has no access to parent '$parent_path' - adding execute-only for traversal"
+            synoacltool -add "$parent_path" "user:$user:allow:--x----------:fd--" 2>/dev/null || log_warn "Failed to add execute permission"
+        else
+            log_info "User '$user' already has some access to parent '$parent_path' - checking if it's sufficient for traversal"
         fi
     fi
     
-    # Don't downgrade from full read access to traversal-only
-    if [ "$permission_type" = "traversal" ] && [ "$has_read_permission" = true ]; then
-        log_info "User '$user' already has read access - not downgrading to traversal-only"
-        return 0
-    fi
-    
-    # STEP 1: Remove ALL existing level:0 entries for this user (clean slate)
-    local existing_level0_indices=$(echo "$current_acl" | grep -n "user:$user:.*level:0" | sed 's/\([0-9]*\):.*\[\([0-9]*\)\].*/\2/' | sort -nr)
-    
-    for index in $existing_level0_indices; do
-        log_info "Removing existing level:0 entry for user '$user' at index $index"
-        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-    done
-    
-    # STEP 2: Add the appropriate permission based on the permission type
-    case "$permission_type" in
-        "yes")
-            # User should have full read access
-            log_info "Adding full read access for user '$user'"
-            synoacltool -add "$folder_path" "user:$user:allow:r-x---aARWc--:fd--" 2>/dev/null || log_warn "Failed to add read access"
-            ;;
-        "traversal")
-            # User needs minimal traversal access (execute only)
-            log_info "Adding traversal-only access for user '$user'"
-            synoacltool -add "$folder_path" "user:$user:allow:--x----------:fd--" 2>/dev/null || log_warn "Failed to add traversal access"
-            ;;
-        "no")
-            # User should be explicitly denied
-            log_info "Adding explicit deny for user '$user'"
-            synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--" 2>/dev/null || log_warn "Failed to add deny rule"
-            ;;
-    esac
+    # Recursively check grandparent directories
+    replace_parent_deny_with_execute "$parent_path" "$user"
 }
 
 # Function to get folder ID from filesystem path
