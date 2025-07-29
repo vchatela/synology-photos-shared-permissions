@@ -197,6 +197,12 @@ run_summary_audit() {
     local misaligned_folder_list=()
     local missing_folder_list=()
     
+    # Arrays to track categorized issues per user
+    declare -A missing_permissions_users  # Users who should have access but are denied
+    declare -A over_privileged_users      # Users who shouldn't have access but can see files
+    declare -A missing_permissions_folders
+    declare -A over_privileged_folders
+    
     # Process each shared folder silently
     while IFS='|' read -r folder_id folder_name; do
         if [ -z "$folder_id" ] || [ -z "$folder_name" ]; then continue; fi
@@ -223,30 +229,41 @@ run_summary_audit() {
                 has_db_access="true"
             fi
             
-        # Test filesystem access
-        local fs_access=$(test_filesystem_access "$username" "$folder_path")
-        local has_fs_access="false"
-        if [ "$fs_access" = "accessible" ]; then
-            has_fs_access="true"
-        fi
-        # Note: traversal_only access is considered aligned with no DB permission
-        # since it allows navigation to child folders without parent folder access
-        
-        # Check alignment - consider traversal_only as aligned when no DB permission
-        # This allows parent folder traversal for child access without full parent access
-        local is_aligned="false"
-        if [ "$has_db_access" = "$has_fs_access" ]; then
-            is_aligned="true"
-        elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
-            # Special case: no DB permission + traversal_only = aligned
-            # This allows navigation to child folders without parent folder access
-            is_aligned="true"
-        fi
-        
-        if [ "$is_aligned" != "true" ]; then
-            ((folder_mismatches++))
-            ((total_mismatches++))
-        fi
+            # Test filesystem access
+            local fs_access=$(test_filesystem_access "$username" "$folder_path")
+            local has_fs_access="false"
+            if [ "$fs_access" = "accessible" ]; then
+                has_fs_access="true"
+            fi
+            # Note: traversal_only access is considered aligned with no DB permission
+            # since it allows navigation to child folders without parent folder access
+            
+            # Check alignment - consider traversal_only as aligned when no DB permission
+            # This allows parent folder traversal for child access without full parent access
+            local is_aligned="false"
+            if [ "$has_db_access" = "$has_fs_access" ]; then
+                is_aligned="true"
+            elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
+                # Special case: no DB permission + traversal_only = aligned
+                # This allows navigation to child folders without parent folder access
+                is_aligned="true"
+            fi
+            
+            if [ "$is_aligned" != "true" ]; then
+                ((folder_mismatches++))
+                ((total_mismatches++))
+                
+                # Categorize the mismatch
+                if [ "$has_db_access" = "true" ] && [ "$has_fs_access" = "false" ]; then
+                    # Missing permissions: DB says OK but FS is denied
+                    missing_permissions_users["$username"]=$((${missing_permissions_users["$username"]:-0} + 1))
+                    missing_permissions_folders["$username"]+="$folder_id ($folder_name), "
+                elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
+                    # Over privileges: No DB permission but FS is accessible (can see files)
+                    over_privileged_users["$username"]=$((${over_privileged_users["$username"]:-0} + 1))
+                    over_privileged_folders["$username"]+="$folder_id ($folder_name), "
+                fi
+            fi
             
         done < <(get_all_users)
         
@@ -326,6 +343,55 @@ run_summary_audit() {
                 printf "%-4s | %s\n" "$folder_id" "$folder_name" | tee -a "$LOG_FILE"
             done
         fi
+    fi
+    
+    # Display categorized permission analysis
+    if [ ${#missing_permissions_users[@]} -gt 0 ] || [ ${#over_privileged_users[@]} -gt 0 ]; then
+        echo
+        echo "======================================================" | tee -a "$LOG_FILE"
+        echo "           CATEGORIZED PERMISSION ANALYSIS" | tee -a "$LOG_FILE"
+        echo "======================================================" | tee -a "$LOG_FILE"
+        
+        # Missing Permissions Category
+        if [ ${#missing_permissions_users[@]} -gt 0 ]; then
+            echo | tee -a "$LOG_FILE"
+            log_error "🚫 MISSING PERMISSIONS (DB permits but FS denies access):"
+            echo "These users should have access according to the database but are denied by the filesystem:" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+            echo "User                | Folders Affected | Folder List" | tee -a "$LOG_FILE"
+            echo "--------------------|------------------|------------------------------------------" | tee -a "$LOG_FILE"
+            
+            for username in "${!missing_permissions_users[@]}"; do
+                local count=${missing_permissions_users["$username"]}
+                local folder_list=${missing_permissions_folders["$username"]}
+                # Remove trailing comma and space
+                folder_list=$(echo "$folder_list" | sed 's/, $//')
+                printf "%-19s | %-16s | %s\n" "$username" "$count" "$folder_list" | tee -a "$LOG_FILE"
+            done
+        fi
+        
+        # Over Privileges Category  
+        if [ ${#over_privileged_users[@]} -gt 0 ]; then
+            echo | tee -a "$LOG_FILE"
+            log_error "⚠️  OVER PRIVILEGES (No DB permission but FS allows file access):"
+            echo "These users can see/access files on the filesystem but shouldn't according to the database:" | tee -a "$LOG_FILE"
+            echo | tee -a "$LOG_FILE"
+            echo "User                | Folders Affected | Folder List" | tee -a "$LOG_FILE"
+            echo "--------------------|------------------|------------------------------------------" | tee -a "$LOG_FILE"
+            
+            for username in "${!over_privileged_users[@]}"; do
+                local count=${over_privileged_users["$username"]}
+                local folder_list=${over_privileged_folders["$username"]}
+                # Remove trailing comma and space
+                folder_list=$(echo "$folder_list" | sed 's/, $//')
+                printf "%-19s | %-16s | %s\n" "$username" "$count" "$folder_list" | tee -a "$LOG_FILE"
+            done
+        fi
+        
+        echo | tee -a "$LOG_FILE"
+        log_audit "Category Summary:"
+        log_audit "  Users with missing permissions: ${#missing_permissions_users[@]}"
+        log_audit "  Users with over privileges: ${#over_privileged_users[@]}"
     fi
     
     # Return appropriate exit code
