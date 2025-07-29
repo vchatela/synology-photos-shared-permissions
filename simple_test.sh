@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Simple test script for the 3 specific folders
-# IDs: 1 (root), 1424 (Anniversaires), 1821 (Valentin)
+# IDs: 1 (root), 23 (Anniversaires), 1821 (Valentin)
 
 # Color output
 RED='\033[0;31m'
@@ -29,13 +29,13 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=== Simple Hierarchical Test ==="
-echo "Processing 3 folders in order: 1 -> 1424 -> 1821"
+echo "Processing 3 folders in order: 1 -> 23 -> 1821"
 echo
 
 # Define the folders (parent to child)
 declare -a folders=(
     "1:/volume1/photo/"
-    "1424:/volume1/photo/Anniversaires/"
+    "23:/volume1/photo/Anniversaires/"
     "1821:/volume1/photo/Anniversaires/Valentin - 29-10-23"
 )
 
