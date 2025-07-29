@@ -247,6 +247,11 @@ Test the scheduled task manually:
 ```bash
 # Test the nightly script
 sudo /volume1/tools/Synology/synology-photos-shared-permissions/nightly_sync_audit.sh
+[2025-07-29 15:52:12] Starting nightly Synology Photos permission sync and audit
+[2025-07-29 15:52:12] Running batch permission sync...
+[2025-07-29 16:02:10] Batch sync completed successfully
+[2025-07-29 16:02:10] Running permission audit...
+[2025-07-29 16:04:00] Permission audit completed - All permissions aligned
 
 # Check exit code
 echo "Exit code: $?"
