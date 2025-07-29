@@ -10,20 +10,29 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Global silent mode flag
+SILENT_MODE=false
+
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    if [ "$SILENT_MODE" = false ]; then
+        echo -e "${GREEN}[INFO]${NC} $1"
+    fi
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    if [ "$SILENT_MODE" = false ]; then
+        echo -e "${YELLOW}[WARN]${NC} $1"
+    fi
 }
 
 log_batch() {
-    echo -e "${BLUE}[BATCH]${NC} $1"
+    if [ "$SILENT_MODE" = false ]; then
+        echo -e "${BLUE}[BATCH]${NC} $1"
+    fi
 }
 
 # Function to get folder name from database
@@ -169,14 +178,38 @@ sync_single_folder() {
 
 # Main batch processing function
 main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --silent|-s)
+                SILENT_MODE=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: $0 [OPTIONS]"
+                echo "Options:"
+                echo "  --silent, -s     Run in silent mode (minimal output, errors only)"
+                echo "  --help, -h       Show this help message"
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+        esac
+    done
+
     # Setup logging first
     setup_logging
     
-    echo "======================================================"
-    echo "     BATCH PERMISSION SYNCHRONIZATION"
-    echo "======================================================"
-    echo "Started at: $(date)"
-    echo
+    if [ "$SILENT_MODE" = false ]; then
+        echo "======================================================"
+        echo "     BATCH PERMISSION SYNCHRONIZATION"
+        echo "======================================================"
+        echo "Started at: $(date)"
+        echo
+    fi
     
     # Get shared folder IDs from database
     log_batch "Getting shared folder IDs from database..."
@@ -224,41 +257,53 @@ main() {
     
     # Process each folder
     for folder_id in "${folder_ids_array[@]}"; do
-        echo "------------------------------------------------------"
+        if [ "$SILENT_MODE" = false ]; then
+            echo "------------------------------------------------------"
+        fi
         if sync_single_folder "$folder_id"; then
             ((success_count++))
         else
             failed_folders+=("$folder_id")
         fi
-        echo
+        if [ "$SILENT_MODE" = false ]; then
+            echo
+        fi
         sleep 1  # Small delay between folders
     done
     
-    echo "======================================================"
-    echo "                BATCH SUMMARY"
-    echo "======================================================"
-    echo "Completed at: $(date)"
+    if [ "$SILENT_MODE" = false ]; then
+        echo "======================================================"
+        echo "                BATCH SUMMARY"
+        echo "======================================================"
+        echo "Completed at: $(date)"
+    fi
     log_batch "Total folders processed: $total_count"
     log_batch "Successfully synced: $success_count"
     log_batch "Failed: $((total_count - success_count))"
     
     if [ ${#failed_folders[@]} -gt 0 ]; then
-        echo
+        if [ "$SILENT_MODE" = false ]; then
+            echo
+        fi
         log_warn "Failed folder IDs: ${failed_folders[*]}"
-        echo
-        log_info "You can manually process failed folders with:"
-        for failed_id in "${failed_folders[@]}"; do
-            echo "  ./sync_permissions.sh $failed_id"
-        done
+        if [ "$SILENT_MODE" = false ]; then
+            echo
+            log_info "You can manually process failed folders with:"
+            for failed_id in "${failed_folders[@]}"; do
+                echo "  ./sync_permissions.sh $failed_id"
+            done
+        fi
     fi
     
-    echo
+    if [ "$SILENT_MODE" = false ]; then
+        echo
+    fi
     if [ $success_count -eq $total_count ]; then
         log_info "🎉 All folders successfully processed!"
         log_batch "Batch sync completed successfully - log saved to: $BATCH_LOG_FILE"
         exit 0
     else
-        log_warn "⚠️  Some folders failed to process. Check the logs above."
+        log_error "⚠️  Some folders failed to process. Check the logs."
         log_batch "Batch sync completed with errors - log saved to: $BATCH_LOG_FILE"
         exit 1
     fi

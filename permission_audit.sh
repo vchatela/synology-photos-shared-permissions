@@ -887,9 +887,11 @@ main() {
     case "$command" in
         "full-audit"|"")
             run_full_audit
+            exit $?
             ;;
         "summary")
             run_summary_audit
+            exit $?
             ;;
         "folder")
             local folder_id=$2
@@ -899,6 +901,7 @@ main() {
                 exit 1
             fi
             audit_single_folder "$folder_id"
+            exit $?
             ;;
         "user")
             local username=$2
@@ -908,6 +911,7 @@ main() {
                 exit 1
             fi
             audit_user "$username"
+            exit $?
             ;;
         "debug")
             local folder_id=$2
@@ -923,6 +927,7 @@ main() {
                 exit 1
             fi
             debug_acl_details "$folder_id" "$folder_name"
+            exit $?
             ;;
         "help"|"-h"|"--help")
             show_usage
