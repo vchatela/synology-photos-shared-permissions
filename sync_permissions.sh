@@ -86,7 +86,73 @@ get_folder_path() {
     fi
 }
 
-# Function to clean up duplicate and redundant ACL entries
+# Function to get the source folder for an inherited ACL entry
+get_acl_source_folder() {
+    local folder_path=$1
+    local level=$2
+    
+    # Level 0 = current folder
+    if [[ "$level" == "0" ]]; then
+        echo "$folder_path"
+        return
+    fi
+    
+    # Level 1 = parent folder, Level 2 = grandparent, etc.
+    local current_path="$folder_path"
+    for ((i=0; i<level; i++)); do
+        current_path=$(dirname "$current_path")
+        # Don't go above /volume1/photo
+        if [[ "$current_path" == "/volume1" ]]; then
+            echo "/volume1/photo"
+            return
+        fi
+    done
+    echo "$current_path"
+}
+
+# Function to remove an inherited duplicate by targeting the source folder
+remove_inherited_duplicate() {
+    local username=$1
+    local permission_type=$2  # "allow" or "deny"
+    local target_folder=$3
+    
+    if [[ ! -d "$target_folder" ]]; then
+        log_warn "Target folder does not exist: $target_folder"
+        return 1
+    fi
+    
+    # Get ACL from target folder
+    local target_acl=$(synoacltool -get "$target_folder")
+    
+    # Find level:0 entries for this user with matching permission type
+    local matching_indices=$(echo "$target_acl" | grep "user:$username:" | grep ":$permission_type:" | grep "level:0" | sed 's/.*\[\([0-9]*\)\].*/\1/')
+    
+    # Count matching entries
+    local count=$(echo "$matching_indices" | wc -w)
+    
+    if [[ $count -eq 0 ]]; then
+        log_warn "No level:0 $permission_type entry found for user $username in $target_folder"
+        return 1
+    elif [[ $count -eq 1 ]]; then
+        log_warn "Only one level:0 $permission_type entry found for user $username in $target_folder - cannot remove without causing issues"
+        return 1
+    else
+        # Multiple entries found - remove one (keep the first, remove the second)
+        local entries_array=($matching_indices)
+        local index_to_remove=${entries_array[1]}  # Remove the second entry
+        
+        log_info "Removing duplicate level:0 $permission_type entry at index $index_to_remove for $username from $target_folder"
+        
+        if synoacltool -del "$target_folder" "$index_to_remove" 2>/dev/null; then
+            return 0
+        else
+            log_warn "Failed to remove entry at index $index_to_remove from $target_folder"
+            return 1
+        fi
+    fi
+}
+
+# Function to clean up duplicate ACL entries (improved to handle inheritance correctly)
 cleanup_acl_duplicates() {
     local folder_path=$1
     
@@ -132,6 +198,10 @@ cleanup_acl_duplicates() {
             
             if [ -z "$entry_line" ]; then continue; fi
             
+            # Extract level from entry
+            local entry_level=$(echo "$entry_line" | sed 's/.*level:\([0-9]\).*/\1/')
+            local target_folder=$(get_acl_source_folder "$folder_path" "$entry_level")
+            
             if echo "$entry_line" | grep -q "level:0"; then
                 if echo "$entry_line" | grep -q ":allow:"; then
                     if [ -z "$kept_level0_allow" ]; then
@@ -139,7 +209,7 @@ cleanup_acl_duplicates() {
                         log_info "Keeping level:0 allow entry at index $index for $username"
                     else
                         log_info "Removing duplicate level:0 allow entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
+                        synoacltool -del "$target_folder" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
                         # Update ACL after removal
                         current_acl=$(synoacltool -get "$folder_path")
                     fi
@@ -149,7 +219,7 @@ cleanup_acl_duplicates() {
                         log_info "Keeping level:0 deny entry at index $index for $username"
                     else
                         log_info "Removing duplicate level:0 deny entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
+                        synoacltool -del "$target_folder" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
                         # Update ACL after removal
                         current_acl=$(synoacltool -get "$folder_path")
                     fi
@@ -160,20 +230,29 @@ cleanup_acl_duplicates() {
                         kept_level1_allow="$index"
                         log_info "Keeping level:1 allow entry at index $index for $username"
                     else
-                        log_info "Removing duplicate level:1 allow entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                        # Update ACL after removal
-                        current_acl=$(synoacltool -get "$folder_path")
+                        log_info "Removing duplicate level:1 allow entry at index $index for $username (targeting $target_folder)"
+                        # Find the corresponding level:0 entry in the parent folder to remove
+                        if remove_inherited_duplicate "$username" "allow" "$target_folder"; then
+                            log_info "Successfully removed inherited duplicate from parent folder"
+                            # Update ACL after removal
+                            current_acl=$(synoacltool -get "$folder_path")
+                        else
+                            log_warn "Failed to remove inherited duplicate from parent folder"
+                        fi
                     fi
                 elif echo "$entry_line" | grep -q ":deny:"; then
                     if [ -z "$kept_level1_deny" ]; then
                         kept_level1_deny="$index"
                         log_info "Keeping level:1 deny entry at index $index for $username"
                     else
-                        log_info "Removing duplicate level:1 deny entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                        # Update ACL after removal
-                        current_acl=$(synoacltool -get "$folder_path")
+                        log_info "Removing duplicate level:1 deny entry at index $index for $username (targeting $target_folder)"
+                        if remove_inherited_duplicate "$username" "deny" "$target_folder"; then
+                            log_info "Successfully removed inherited duplicate from parent folder"
+                            # Update ACL after removal
+                            current_acl=$(synoacltool -get "$folder_path")
+                        else
+                            log_warn "Failed to remove inherited duplicate from parent folder"
+                        fi
                     fi
                 fi
             elif echo "$entry_line" | grep -q "level:2"; then
@@ -182,20 +261,28 @@ cleanup_acl_duplicates() {
                         kept_level2_allow="$index"
                         log_info "Keeping level:2 allow entry at index $index for $username"
                     else
-                        log_info "Removing duplicate level:2 allow entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                        # Update ACL after removal
-                        current_acl=$(synoacltool -get "$folder_path")
+                        log_info "Removing duplicate level:2 allow entry at index $index for $username (targeting $target_folder)"
+                        if remove_inherited_duplicate "$username" "allow" "$target_folder"; then
+                            log_info "Successfully removed inherited duplicate from grandparent folder"
+                            # Update ACL after removal
+                            current_acl=$(synoacltool -get "$folder_path")
+                        else
+                            log_warn "Failed to remove inherited duplicate from grandparent folder"
+                        fi
                     fi
                 elif echo "$entry_line" | grep -q ":deny:"; then
                     if [ -z "$kept_level2_deny" ]; then
                         kept_level2_deny="$index"
                         log_info "Keeping level:2 deny entry at index $index for $username"
                     else
-                        log_info "Removing duplicate level:2 deny entry at index $index for $username"
-                        synoacltool -del "$folder_path" "$index" 2>/dev/null || log_warn "Failed to remove entry at index $index"
-                        # Update ACL after removal
-                        current_acl=$(synoacltool -get "$folder_path")
+                        log_info "Removing duplicate level:2 deny entry at index $index for $username (targeting $target_folder)"
+                        if remove_inherited_duplicate "$username" "deny" "$target_folder"; then
+                            log_info "Successfully removed inherited duplicate from grandparent folder"
+                            # Update ACL after removal
+                            current_acl=$(synoacltool -get "$folder_path")
+                        else
+                            log_warn "Failed to remove inherited duplicate from grandparent folder"
+                        fi
                     fi
                 fi
             fi

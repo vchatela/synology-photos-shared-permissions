@@ -115,6 +115,8 @@ test_filesystem_access() {
     # by testing if they can change into the directory
     if su "$username" -s /bin/bash -c "cd $escaped_path 2>/dev/null && pwd >/dev/null 2>&1"; then
         # Can access directory but not list it - execute-only (traversal)
+        # This is used for parent folders where users need to traverse to reach child folders
+        # but shouldn't have access to the parent folder contents
         echo "traversal_only"
     else
         # Cannot even access the directory - explicit deny or no permissions
@@ -227,12 +229,24 @@ run_summary_audit() {
         if [ "$fs_access" = "accessible" ]; then
             has_fs_access="true"
         fi
-        # Note: traversal_only access is treated as "no effective access" for DB comparison
-        # since DB permissions should grant full read access, not just traversal            # Check alignment
-            if [ "$has_db_access" != "$has_fs_access" ]; then
-                ((folder_mismatches++))
-                ((total_mismatches++))
-            fi
+        # Note: traversal_only access is considered aligned with no DB permission
+        # since it allows navigation to child folders without parent folder access
+        
+        # Check alignment - consider traversal_only as aligned when no DB permission
+        # This allows parent folder traversal for child access without full parent access
+        local is_aligned="false"
+        if [ "$has_db_access" = "$has_fs_access" ]; then
+            is_aligned="true"
+        elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
+            # Special case: no DB permission + traversal_only = aligned
+            # This allows navigation to child folders without parent folder access
+            is_aligned="true"
+        fi
+        
+        if [ "$is_aligned" != "true" ]; then
+            ((folder_mismatches++))
+            ((total_mismatches++))
+        fi
             
         done < <(get_all_users)
         
@@ -364,17 +378,27 @@ audit_folder() {
             has_fs_access="true"
             ((fs_accessible_users++))
         fi
-        # Note: traversal_only access is treated as "no effective access" for DB comparison
-        # since DB permissions should grant full read access, not just traversal
+        # Note: traversal_only access is considered aligned with no DB permission
+        # since it allows navigation to child folders without parent folder access
         
         # For detailed debugging of mismatches, check ACL details
         local acl_analysis=""
-        if [ "$has_db_access" != "$has_fs_access" ]; then
+        local is_aligned="false"
+        
+        # Check alignment - consider traversal_only as aligned when no DB permission
+        # This allows parent folder traversal for child access without full parent access
+        if [ "$has_db_access" = "$has_fs_access" ]; then
+            is_aligned="true"
+        elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
+            # Special case: no DB permission + traversal_only = aligned
+            # This allows navigation to child folders without parent folder access
+            is_aligned="true"
+        else
             acl_analysis=$(check_comprehensive_acl "$username" "$folder_path")
         fi
         
         # Check alignment
-        if [ "$has_db_access" = "$has_fs_access" ]; then
+        if [ "$is_aligned" = "true" ]; then
             ((aligned_users++))
             if [ "$has_db_access" = "true" ]; then
                 log_success "  ✓ $username: DB permission ($db_perm) + FS accessible - ALIGNED"
@@ -572,16 +596,27 @@ audit_user() {
             has_fs_access="true"
             ((user_has_fs_access++))
         fi
-        # Note: traversal_only access is treated as "no effective access" for DB comparison
+        # Note: traversal_only access is considered aligned with no DB permission
+        # since it allows navigation to child folders without parent folder access
         
         # For detailed debugging of mismatches, check ACL details
         local acl_analysis=""
-        if [ "$has_db_access" != "$has_fs_access" ]; then
+        local is_aligned="false"
+        
+        # Check alignment - consider traversal_only as aligned when no DB permission
+        # This allows parent folder traversal for child access without full parent access
+        if [ "$has_db_access" = "$has_fs_access" ]; then
+            is_aligned="true"
+        elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
+            # Special case: no DB permission + traversal_only = aligned
+            # This allows navigation to child folders without parent folder access
+            is_aligned="true"
+        else
             acl_analysis=$(check_comprehensive_acl "$target_user" "$folder_path")
         fi
         
         # Check alignment
-        if [ "$has_db_access" = "$has_fs_access" ]; then
+        if [ "$is_aligned" = "true" ]; then
             ((aligned_folders++))
             if [ "$has_db_access" = "true" ]; then
                 log_success "  ✓ Folder $folder_id ($folder_name): DB perm ($db_perm) + FS access - ALIGNED"
@@ -618,6 +653,123 @@ audit_user() {
     fi
 }
 
+# Function to debug ACL details for a specific folder and users
+debug_acl_details() {
+    local folder_id=$1
+    local folder_name=$2
+    local folder_path=$(get_folder_path "$folder_name")
+    
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "        ACL DEBUG ANALYSIS" | tee -a "$LOG_FILE"
+    echo "======================================================" | tee -a "$LOG_FILE"
+    echo "Folder ID: $folder_id" | tee -a "$LOG_FILE"
+    echo "Folder Name: $folder_name" | tee -a "$LOG_FILE"
+    echo "Folder Path: $folder_path" | tee -a "$LOG_FILE"
+    echo "Started at: $(date)" | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+    
+    if ! folder_exists "$folder_path"; then
+        log_error "Folder does not exist on filesystem"
+        return 1
+    fi
+    
+    # Get the complete ACL dump
+    log_info "Complete ACL structure:" | tee -a "$LOG_FILE"
+    synoacltool -get "$folder_path" 2>/dev/null | tee -a "$LOG_FILE"
+    echo | tee -a "$LOG_FILE"
+    
+    # Check each user's specific situation
+    log_info "User-by-user analysis:" | tee -a "$LOG_FILE"
+    while IFS= read -r username; do
+        if [ -z "$username" ]; then continue; fi
+        
+        # Get database permission
+        local db_perm=$(get_db_permission "$folder_id" "$username")
+        local has_db_access="false"
+        if [ -n "$db_perm" ] && [ "$db_perm" -gt 0 ]; then
+            has_db_access="true"
+        fi
+        
+        # Test filesystem access
+        local fs_access=$(test_filesystem_access "$username" "$folder_path")
+        local has_fs_access="false"
+        if [ "$fs_access" = "accessible" ]; then
+            has_fs_access="true"
+        fi
+        
+        # Get user's ACL entries
+        local user_acl=$(synoacltool -get "$folder_path" 2>/dev/null | grep "user:$username:" || echo "No ACL entries")
+        
+        # Check alignment
+        local is_aligned="false"
+        if [ "$has_db_access" = "$has_fs_access" ]; then
+            is_aligned="true"
+        elif [ "$has_db_access" = "false" ] && [ "$fs_access" = "traversal_only" ]; then
+            is_aligned="true"
+        fi
+        
+        if [ "$is_aligned" = "true" ]; then
+            log_success "✓ $username: ALIGNED (DB: $has_db_access, FS: $fs_access)" | tee -a "$LOG_FILE"
+        else
+            log_mismatch "✗ $username: MISMATCH (DB: $has_db_access, FS: $fs_access)" | tee -a "$LOG_FILE"
+            log_info "  DB Permission: ${db_perm:-none}" | tee -a "$LOG_FILE"
+            log_info "  FS Access: $fs_access" | tee -a "$LOG_FILE"
+            log_info "  ACL Entries:" | tee -a "$LOG_FILE"
+            echo "    $user_acl" | tee -a "$LOG_FILE"
+            
+            # Test individual ACL commands for troubleshooting
+            log_info "  Manual access tests:" | tee -a "$LOG_FILE"
+            echo -n "    ls test: " | tee -a "$LOG_FILE"
+            local ls_output=$(su "$username" -s /bin/bash -c "ls '$folder_path' 2>/dev/null")
+            local ls_exit_code=$?
+            if [ $ls_exit_code -eq 0 ]; then
+                local file_count=$(echo "$ls_output" | wc -l)
+                if [ -z "$ls_output" ]; then
+                    file_count=0
+                fi
+                echo "SUCCESS (can list, $file_count items visible)" | tee -a "$LOG_FILE"
+            else
+                echo "FAILED (cannot list)" | tee -a "$LOG_FILE"
+            fi
+            
+            echo -n "    cd test: " | tee -a "$LOG_FILE"
+            if su "$username" -s /bin/bash -c "cd '$folder_path' 2>/dev/null && pwd >/dev/null 2>&1"; then
+                echo "SUCCESS (can access)" | tee -a "$LOG_FILE"
+            else
+                echo "FAILED (cannot access)" | tee -a "$LOG_FILE"
+            fi
+            
+            echo -n "    stat test: " | tee -a "$LOG_FILE"
+            if su "$username" -s /bin/bash -c "stat '$folder_path' >/dev/null 2>&1"; then
+                echo "SUCCESS (can stat)" | tee -a "$LOG_FILE"
+            else
+                echo "FAILED (cannot stat)" | tee -a "$LOG_FILE"
+            fi
+            
+            # Test read directory permissions specifically
+            echo -n "    readdir test: " | tee -a "$LOG_FILE"
+            local readdir_output=$(su "$username" -s /bin/bash -c "ls -la '$folder_path' 2>/dev/null | head -10")
+            if [ $? -eq 0 ] && [ -n "$readdir_output" ]; then
+                echo "SUCCESS (can read directory contents)" | tee -a "$LOG_FILE"
+            else
+                echo "FAILED (cannot read directory contents - pure traversal only)" | tee -a "$LOG_FILE"
+            fi
+        fi
+        echo | tee -a "$LOG_FILE"
+        
+    done < <(get_all_users)
+    
+    # Check parent folder ACLs if this is a subfolder
+    if [[ "$folder_name" == */* ]]; then
+        local parent_path=$(dirname "$folder_path")
+        log_info "Parent folder ACL analysis:" | tee -a "$LOG_FILE"
+        log_info "Parent Path: $parent_path" | tee -a "$LOG_FILE"
+        synoacltool -get "$parent_path" 2>/dev/null | tee -a "$LOG_FILE"
+    fi
+    
+    return 0
+}
+
 # Function to show usage
 show_usage() {
     echo "Usage: $0 [command] [options]"
@@ -627,6 +779,7 @@ show_usage() {
     echo "  summary              - Quick summary audit without detailed folder output"
     echo "  folder <folder_id>   - Audit specific folder"
     echo "  user <username>      - Audit specific user across all folders"
+    echo "  debug <folder_id>    - Debug ACL details for specific folder"
     echo "  help                 - Show this help message"
     echo
     echo "Examples:"
@@ -634,6 +787,7 @@ show_usage() {
     echo "  $0 summary           - Run quick summary audit"
     echo "  $0 folder 432        - Audit folder ID 432"
     echo "  $0 user famille      - Audit user 'famille' across all folders"
+    echo "  $0 debug 304         - Debug ACL details for folder ID 304"
     echo
     echo "All results are logged to: logs/permission_audit_YYYYMMDD_HHMMSS.log"
 }
@@ -688,6 +842,21 @@ main() {
                 exit 1
             fi
             audit_user "$username"
+            ;;
+        "debug")
+            local folder_id=$2
+            if [ -z "$folder_id" ]; then
+                log_error "Please specify a folder ID"
+                show_usage
+                exit 1
+            fi
+            # Get folder name
+            local folder_name=$(sudo -u postgres psql -d synofoto -t -A -c "SELECT name FROM folder WHERE id = $folder_id;" 2>/dev/null)
+            if [ -z "$folder_name" ]; then
+                log_error "Folder ID $folder_id not found in database"
+                exit 1
+            fi
+            debug_acl_details "$folder_id" "$folder_name"
             ;;
         "help"|"-h"|"--help")
             show_usage
