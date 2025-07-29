@@ -38,6 +38,94 @@ ORDER BY name;
 " 2>/dev/null | grep -v "^$"
 }
 
+# Function to get all users who have database permissions in ANY folder (for root folder strategy)
+get_users_with_any_folder_permissions() {
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT DISTINCT ui.name
+FROM share_permission sp
+JOIN user_info ui ON sp.target_id = ui.id
+JOIN folder f ON f.passphrase_share = sp.passphrase_share
+WHERE f.id > 1 
+  AND sp.permission > 0
+  AND ui.name NOT LIKE '/volume1%' 
+  AND ui.name != '' 
+  AND ui.name IS NOT NULL
+  AND ui.name NOT IN ('guest', 'admin', 'root', 'chef', 'temp_adm', 'backup', 'webdav_syno-j', 'unifi', 'shield', 'n8n', 'jeedom', 'cert-renewal')
+ORDER BY ui.name;
+" 2>/dev/null | grep -v "^$"
+}
+
+# Function to apply root folder permissions strategy
+# Root folder (ID=1, /volume1/photo) gets special handling:
+# - Users with permissions in ANY subfolder get read+execute access to root
+# - This allows discovery and traversal without granting unnecessary access
+apply_root_folder_strategy() {
+    local root_path="/volume1/photo"
+    
+    log_info "=== APPLYING ROOT FOLDER STRATEGY ==="
+    log_info "Root folder: $root_path (Special handling for folder ID=1)"
+    
+    if [ ! -d "$root_path" ]; then
+        log_error "Root folder does not exist: $root_path"
+        return 1
+    fi
+    
+    # Get users who have permissions in any subfolders
+    log_info "Getting users with subfolder permissions..."
+    local authorized_users=$(get_users_with_any_folder_permissions)
+    
+    if [ -z "$authorized_users" ]; then
+        log_warn "No users found with subfolder permissions"
+        return 0
+    fi
+    
+    log_info "Users with subfolder permissions (will get root folder read+execute):"
+    echo "$authorized_users" | while read -r user; do
+        log_info "  - $user"
+    done
+    
+    # Clean existing level:0 ACL entries from root folder
+    log_info "Cleaning existing level:0 ACL entries from root folder..."
+    clean_all_level0_acl_entries "$root_path"
+    
+    # Apply read+execute permissions for authorized users
+    log_info "Applying read+execute permissions for authorized users..."
+    echo "$authorized_users" | while read -r username; do
+        if [ -n "$username" ]; then
+            log_info "Granting root folder read+execute to user: $username"
+            # Grant read+execute (discovery and traversal) permissions
+            synoacltool -add "$root_path" "user:$username:allow:r-x---aARWc--:fd--" 2>/dev/null
+            if [ $? -eq 0 ]; then
+                log_info "Successfully granted root folder access to $username"
+            else
+                log_error "Failed to grant root folder access to $username"
+            fi
+        fi
+    done
+    
+    # Apply deny rules for users who don't have ANY subfolder permissions
+    log_info "Applying deny rules for unauthorized users..."
+    local all_users=$(get_all_system_users)
+    for user in $all_users; do
+        # Skip if user is authorized
+        if echo "$authorized_users" | grep -q "^$user$"; then
+            continue
+        fi
+        
+        # Skip system users that shouldn't be modified
+        if [[ "$user" =~ ^(backup|webdav_syno-j|unifi|temp_adm|shield|n8n|jeedom|cert-renewal|guest|admin|root|chef)$ ]]; then
+            continue
+        fi
+        
+        # Add explicit deny rule for unauthorized users
+        log_info "Adding deny rule for unauthorized user: $user"
+        synoacltool -add "$root_path" "user:$user:deny:rwxpdDaARWcCo:fd--" 2>/dev/null || true
+    done
+    
+    log_info "=== ROOT FOLDER STRATEGY COMPLETED ==="
+    return 0
+}
+
 # Function to convert database permission bitmap to ACL permissions
 # According to requirements: EVERYONE gets read-only access regardless of database permission level
 # Permission bitmap meanings:
@@ -350,6 +438,13 @@ deny_inherited_unauthorized_users() {
 sync_folder_permissions() {
     local folder_id=$1
     
+    # Special handling for root folder (ID=1)
+    if [ "$folder_id" = "1" ]; then
+        log_warn "Root folder (ID=1) detected - applying special root folder strategy"
+        apply_root_folder_strategy
+        return $?
+    fi
+    
     log_info "Starting permission sync for folder ID: $folder_id"
     
     # Get folder path
@@ -402,9 +497,12 @@ sync_folder_permissions() {
     fi
     
     # STEP 3: Add explicit deny rules for unauthorized users
+    # This includes users who have root folder access but no permission for THIS specific folder
     local all_users=$(get_all_system_users)
+    local users_with_any_subfolder_access=$(get_users_with_any_folder_permissions)
+    
     for user in $all_users; do
-        # Skip if user is authorized
+        # Skip if user is authorized for THIS folder
         if echo "$authorized_users" | grep -q "\b$user\b"; then
             continue
         fi
@@ -415,7 +513,13 @@ sync_folder_permissions() {
         fi
         
         # Add explicit deny rule for unauthorized users
-        log_info "Adding explicit deny rule for unauthorized user '$user'"
+        # This is CRITICAL: users who have root access due to other folder permissions
+        # must be explicitly denied access to folders they don't have permission for
+        if echo "$users_with_any_subfolder_access" | grep -q "^$user$"; then
+            log_info "Adding explicit deny rule for user '$user' (has root access but no permission for this folder)"
+        else
+            log_info "Adding explicit deny rule for unauthorized user '$user'"
+        fi
         synoacltool -add "$folder_path" "user:$user:deny:rwxpdDaARWcCo:fd--" 2>/dev/null || true
     done
     
@@ -705,6 +809,12 @@ main() {
     
     echo "=== Synology Photos Permission Synchronization ==="
     echo "Folder ID: $folder_id"
+    
+    # Special note for root folder
+    if [ "$folder_id" = "1" ]; then
+        echo "NOTE: Root folder (ID=1) uses special permission strategy"
+        echo "      Users with ANY subfolder permissions get read+execute on root"
+    fi
     echo
     
     # Validate setup

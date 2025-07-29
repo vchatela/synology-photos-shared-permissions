@@ -459,6 +459,10 @@ audit_folder() {
             # Special case: no DB permission + traversal_only = aligned
             # This allows navigation to child folders without parent folder access
             is_aligned="true"
+        elif [ "$folder_id" = "1" ] && [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
+            # Special case for root folder (ID=1): users with no DB permission but FS access
+            # are aligned due to root folder strategy that grants access for folder discovery
+            is_aligned="true"
         else
             acl_analysis=$(check_comprehensive_acl "$username" "$folder_path")
         fi
@@ -471,6 +475,8 @@ audit_folder() {
             else
                 if [ "$fs_access" = "traversal_only" ]; then
                     log_success "  ✓ $username: No DB permission + FS traversal-only - ALIGNED (traversal for child access)"
+                elif [ "$folder_id" = "1" ] && [ "$fs_access" = "accessible" ]; then
+                    log_success "  ✓ $username: No DB permission + FS accessible - ALIGNED (root folder strategy for discovery)"
                 else
                     log_success "  ✓ $username: No DB permission + FS denied - ALIGNED"
                 fi
