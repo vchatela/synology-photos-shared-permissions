@@ -263,6 +263,27 @@ All nightly runs are logged to:
 logs/nightly_sync_audit_YYYYMMDD_HHMMSS.log
 ```
 
+## Directory Structure
+
+The project is organized with the following structure:
+
+### Core Scripts (Root Directory)
+- `sync_permissions.sh` - Individual folder synchronization
+- `permission_audit.sh` - Coherence validation
+- `batch_sync.sh` - System-wide processing
+- `nightly_sync_audit.sh` - Automated scheduling script
+
+### Tools Directory (`tools/`)
+Development and testing utilities:
+- `extended_test.sh` - Extended testing scenarios
+- `simple_test.sh` - Basic functionality tests
+- `test_problematic_folders.sh` - Edge case testing
+- `validate_permissions.sh` - Permission validation utility
+- `fix_ownership.sh` - **PhotoStation migration cleanup**: Fixes orphaned folders from PhotoStation → Synology Photos migration (UID 138862). Run this after migration to clean up unattached folders before permission synchronization.
+
+### Logs Directory (`logs/`)
+All execution logs are automatically stored here with timestamped filenames.
+
 ## Conclusion
 
 This approach allows you to enumerate all users with access to a shared folder in Synology Photos, along with their permission levels, by querying the underlying database.
