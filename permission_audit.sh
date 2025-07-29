@@ -247,6 +247,10 @@ run_summary_audit() {
                 # Special case: no DB permission + traversal_only = aligned
                 # This allows navigation to child folders without parent folder access
                 is_aligned="true"
+            elif [ "$folder_id" = "1" ] && [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
+                # Special case for root folder (ID=1): users with no DB permission but FS access
+                # are aligned due to root folder strategy that grants access for folder discovery
+                is_aligned="true"
             fi
             
             if [ "$is_aligned" != "true" ]; then
@@ -260,8 +264,11 @@ run_summary_audit() {
                     missing_permissions_folders["$username"]+="$folder_id ($folder_name), "
                 elif [ "$has_db_access" = "false" ] && [ "$has_fs_access" = "true" ]; then
                     # Over privileges: No DB permission but FS is accessible (can see files)
-                    over_privileged_users["$username"]=$((${over_privileged_users["$username"]:-0} + 1))
-                    over_privileged_folders["$username"]+="$folder_id ($folder_name), "
+                    # Note: Skip root folder (ID=1) as this is expected due to root folder strategy
+                    if [ "$folder_id" != "1" ]; then
+                        over_privileged_users["$username"]=$((${over_privileged_users["$username"]:-0} + 1))
+                        over_privileged_folders["$username"]+="$folder_id ($folder_name), "
+                    fi
                 fi
             fi
             
