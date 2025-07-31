@@ -246,8 +246,10 @@ analyze_inherited_permissions() {
         log_warn "⚠️  Found $inherited_count subfolder(s) that may need permission updates"
         log_warn "   These folders are using default inherited permissions"
         log_warn "   Consider setting specific permissions for better access control"
+        local exit_code=1
     else
         log_info "✅ All subfolders have custom permissions configured"
+        local exit_code=0
     fi
     
     # Finalize JSON output
@@ -261,6 +263,9 @@ analyze_inherited_permissions() {
     fi
     
     echo "Completed at: $(date)" | tee -a "$LOG_FILE"
+    
+    # Return appropriate exit code
+    return $exit_code
 }
 
 # Function to display help
@@ -284,6 +289,11 @@ show_help() {
     echo "  folder, indicating they are using default inherited permissions rather"
     echo "  than custom configured permissions."
     echo
+    echo "Exit Codes:"
+    echo "  0 - No inherited permissions found (all folders have custom permissions)"
+    echo "  1 - Inherited permissions detected (action may be needed)"
+    echo "  2 - Script error or invalid arguments"
+    echo
     echo "Output Files:"
     echo "  CSV exports: exports/inherited_permissions_YYYYMMDD_HHMMSS.csv"
     echo "  JSON exports: exports/inherited_permissions_YYYYMMDD_HHMMSS.json"
@@ -295,26 +305,31 @@ case "${1:-console}" in
     "console"|"")
         validate_prerequisites
         analyze_inherited_permissions "console"
+        exit $?
         ;;
     "csv")
         validate_prerequisites
         analyze_inherited_permissions "csv"
+        exit $?
         ;;
     "json")
         validate_prerequisites
         analyze_inherited_permissions "json"
+        exit $?
         ;;
     "all")
         validate_prerequisites
         analyze_inherited_permissions "all"
+        exit $?
         ;;
     "help"|"-h"|"--help")
         show_help
+        exit 0
         ;;
     *)
         log_error "Unknown option: $1"
         echo
         show_help
-        exit 1
+        exit 2
         ;;
 esac
