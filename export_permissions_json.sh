@@ -14,8 +14,10 @@ LOG_FILE="$LOG_DIR/export_permissions_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p "$LOG_DIR"
 mkdir -p "$EXPORTS_DIR"
 
-# Default output file
+# Default output files
 OUTPUT_FILE="$EXPORTS_DIR/synology_photos_permissions_$(date +%Y%m%d_%H%M%S).json"
+SUMMARY_FILE="$EXPORTS_DIR/synology_photos_permissions_summary_$(date +%Y%m%d_%H%M%S).txt"
+CSV_FILE="$EXPORTS_DIR/synology_photos_permissions_$(date +%Y%m%d_%H%M%S).csv"
 
 # Color output for logging
 GREEN='\033[0;32m'
@@ -60,6 +62,67 @@ validate_setup() {
     fi
     
     return 0
+}
+
+# Function to get all unique users
+get_all_users() {
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT DISTINCT ui.name as username
+FROM folder f
+JOIN share_permission sp ON f.passphrase_share = sp.passphrase_share
+LEFT JOIN user_info ui ON sp.target_id = ui.id
+WHERE f.id > 1 
+  AND f.name IS NOT NULL 
+  AND f.name != '/' 
+  AND f.name != ''
+  AND f.name NOT LIKE '%#recycle%'
+  AND f.name NOT LIKE '%@eaDir%'
+  AND f.name NOT LIKE '%.__%'
+  AND sp.target_id != 0
+  AND ui.name IS NOT NULL
+ORDER BY ui.name;
+" 2>/dev/null
+}
+
+# Function to get all unique folders
+get_all_folders() {
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT DISTINCT f.id, f.name
+FROM folder f
+JOIN share_permission sp ON f.passphrase_share = sp.passphrase_share
+WHERE f.id > 1 
+  AND f.name IS NOT NULL 
+  AND f.name != '/' 
+  AND f.name != ''
+  AND f.name NOT LIKE '%#recycle%'
+  AND f.name NOT LIKE '%@eaDir%'
+  AND f.name NOT LIKE '%.__%'
+ORDER BY f.name;
+" 2>/dev/null
+}
+
+# Function to get simplified permissions data for summary table
+get_folder_permissions_summary() {
+    sudo -u postgres psql -d synofoto -t -A -c "
+SELECT 
+    f.id as folder_id,
+    f.name as folder_name,
+    ui.name as username,
+    CASE WHEN sp.permission > 0 THEN 1 ELSE 0 END as has_permission
+FROM folder f
+JOIN share_permission sp ON f.passphrase_share = sp.passphrase_share
+LEFT JOIN user_info ui ON sp.target_id = ui.id
+WHERE f.id > 1 
+  AND f.name IS NOT NULL 
+  AND f.name != '/' 
+  AND f.name != ''
+  AND f.name NOT LIKE '%#recycle%'
+  AND f.name NOT LIKE '%@eaDir%'
+  AND f.name NOT LIKE '%.__%'
+  AND sp.target_id != 0
+  AND ui.name IS NOT NULL
+ORDER BY f.name, ui.name;
+" 2>/dev/null
 }
 
 # Function to decode permission bitmap to human-readable format
@@ -278,22 +341,292 @@ export_to_json() {
     return 0
 }
 
+# Function to export permissions summary table
+export_summary_table() {
+    local output_file=$1
+    
+    log_info "Starting permissions summary export..."
+    log_info "Summary output file: $output_file"
+    
+    # Get all users and folders
+    local users=()
+    local folders=()
+    
+    # Read users into array
+    while IFS= read -r username; do
+        if [ -n "$username" ]; then
+            users+=("$username")
+        fi
+    done < <(get_all_users)
+    
+    # Read folders into associative array (folder_name -> folder_id)
+    declare -A folder_names
+    while IFS='|' read -r folder_id folder_name; do
+        if [ -n "$folder_name" ]; then
+            folders+=("$folder_name")
+            folder_names["$folder_name"]="$folder_id"
+        fi
+    done < <(get_all_folders)
+    
+    log_info "Found ${#users[@]} users and ${#folders[@]} shared folders"
+    
+    # Create permissions matrix
+    declare -A permission_matrix
+    
+    # Initialize matrix with no permissions
+    for folder in "${folders[@]}"; do
+        for user in "${users[@]}"; do
+            permission_matrix["$folder|$user"]="-"
+        done
+    done
+    
+    # Fill matrix with actual permissions
+    while IFS='|' read -r folder_id folder_name username has_permission; do
+        if [ -n "$folder_name" ] && [ -n "$username" ]; then
+            if [ "$has_permission" = "1" ]; then
+                permission_matrix["$folder_name|$username"]="X"
+            fi
+        fi
+    done < <(get_folder_permissions_summary)
+    
+    # Write header to file
+    {
+        echo "======================================================"
+        echo "    SYNOLOGY PHOTOS PERMISSIONS SUMMARY TABLE"
+        echo "======================================================"
+        echo "Generated on: $(date)"
+        echo "Legend: X = Has Permission, - = No Permission"
+        echo ""
+        echo "Total Folders: ${#folders[@]}"
+        echo "Total Users: ${#users[@]}"
+        echo "======================================================"
+        echo ""
+        
+        # Calculate column widths
+        local max_folder_width=15
+        for folder in "${folders[@]}"; do
+            if [ ${#folder} -gt $max_folder_width ]; then
+                max_folder_width=${#folder}
+            fi
+        done
+        
+        # Ensure minimum width for readability
+        if [ $max_folder_width -lt 20 ]; then
+            max_folder_width=20
+        fi
+        
+        # Print table header
+        printf "%-${max_folder_width}s" "FOLDER NAME"
+        for user in "${users[@]}"; do
+            printf " | %-8s" "${user:0:8}"  # Truncate usernames to 8 chars for table formatting
+        done
+        echo ""
+        
+        # Print separator line
+        printf "%s" "$(printf "%-${max_folder_width}s" "" | tr ' ' '-')"
+        for user in "${users[@]}"; do
+            printf "%s" "-+-$(printf "%-8s" "" | tr ' ' '-')"
+        done
+        echo ""
+        
+        # Print data rows
+        for folder in "${folders[@]}"; do
+            # Truncate folder name if too long, but show full name in parentheses
+            local display_folder="$folder"
+            if [ ${#folder} -gt $max_folder_width ]; then
+                display_folder="${folder:0:$((max_folder_width-3))}..."
+            fi
+            
+            printf "%-${max_folder_width}s" "$display_folder"
+            for user in "${users[@]}"; do
+                local perm="${permission_matrix["$folder|$user"]}"
+                printf " | %-8s" "$perm"
+            done
+            echo ""
+        done
+        
+        echo ""
+        echo "======================================================"
+        echo "SUMMARY STATISTICS"
+        echo "======================================================"
+        
+        # Calculate statistics
+        local total_permissions=0
+        local total_possible=$((${#folders[@]} * ${#users[@]}))
+        
+        for folder in "${folders[@]}"; do
+            for user in "${users[@]}"; do
+                if [ "${permission_matrix["$folder|$user"]}" = "X" ]; then
+                    ((total_permissions++))
+                fi
+            done
+        done
+        
+        local coverage_percent=0
+        if [ $total_possible -gt 0 ]; then
+            coverage_percent=$((total_permissions * 100 / total_possible))
+        fi
+        
+        echo "Total shared folders: ${#folders[@]}"
+        echo "Total users: ${#users[@]}"
+        echo "Total permissions granted: $total_permissions"
+        echo "Total possible permissions: $total_possible"
+        echo "Permission coverage: $coverage_percent%"
+        echo ""
+        
+        # User statistics
+        echo "USER PERMISSION COUNTS:"
+        echo "----------------------"
+        for user in "${users[@]}"; do
+            local user_perms=0
+            for folder in "${folders[@]}"; do
+                if [ "${permission_matrix["$folder|$user"]}" = "X" ]; then
+                    ((user_perms++))
+                fi
+            done
+            local user_percent=0
+            if [ ${#folders[@]} -gt 0 ]; then
+                user_percent=$((user_perms * 100 / ${#folders[@]}))
+            fi
+            printf "%-15s: %d/%d folders (%d%%)\n" "$user" "$user_perms" "${#folders[@]}" "$user_percent"
+        done
+        
+        echo ""
+        echo "FOLDER SHARING STATISTICS:"
+        echo "-------------------------"
+        for folder in "${folders[@]}"; do
+            local folder_users=0
+            for user in "${users[@]}"; do
+                if [ "${permission_matrix["$folder|$user"]}" = "X" ]; then
+                    ((folder_users++))
+                fi
+            done
+            local folder_percent=0
+            if [ ${#users[@]} -gt 0 ]; then
+                folder_percent=$((folder_users * 100 / ${#users[@]}))
+            fi
+            printf "%-30s: %d/%d users (%d%%)\n" "${folder:0:30}" "$folder_users" "${#users[@]}" "$folder_percent"
+        done
+        
+        echo ""
+        echo "Export completed at: $(date)"
+        echo "======================================================"
+        
+    } > "$output_file"
+    
+    log_info "Summary table export completed successfully!"
+    log_info "Total permissions: $total_permissions out of $total_possible possible"
+    log_info "Coverage: $coverage_percent%"
+    
+    return 0
+}
+
+# Function to export permissions to CSV
+export_to_csv() {
+    local output_file=$1
+    
+    log_info "Starting permissions CSV export..."
+    log_info "CSV output file: $output_file"
+    
+    # Get all users and folders
+    local users=()
+    local folders=()
+    
+    # Read users into array
+    while IFS= read -r username; do
+        if [ -n "$username" ]; then
+            users+=("$username")
+        fi
+    done < <(get_all_users)
+    
+    # Read folders into array
+    while IFS='|' read -r folder_id folder_name; do
+        if [ -n "$folder_name" ]; then
+            folders+=("$folder_name")
+        fi
+    done < <(get_all_folders)
+    
+    log_info "Found ${#users[@]} users and ${#folders[@]} shared folders"
+    
+    # Create permissions matrix
+    declare -A permission_matrix
+    
+    # Initialize matrix with no permissions
+    for folder in "${folders[@]}"; do
+        for user in "${users[@]}"; do
+            permission_matrix["$folder|$user"]="-"
+        done
+    done
+    
+    # Fill matrix with actual permissions
+    while IFS='|' read -r folder_id folder_name username has_permission; do
+        if [ -n "$folder_name" ] && [ -n "$username" ]; then
+            if [ "$has_permission" = "1" ]; then
+                permission_matrix["$folder_name|$username"]="X"
+            fi
+        fi
+    done < <(get_folder_permissions_summary)
+    
+    # Write CSV header
+    {
+        printf "Folder"
+        for user in "${users[@]}"; do
+            printf ",%s" "$user"
+        done
+        echo ""
+        
+        # Write data rows
+        for folder in "${folders[@]}"; do
+            # Escape folder name for CSV (handle commas and quotes)
+            local escaped_folder="$folder"
+            if [[ "$folder" == *","* ]] || [[ "$folder" == *"\""* ]]; then
+                escaped_folder="\"$(echo "$folder" | sed 's/"/""/g')\""
+            fi
+            
+            printf "%s" "$escaped_folder"
+            for user in "${users[@]}"; do
+                local perm="${permission_matrix["$folder|$user"]}"
+                printf ",%s" "$perm"
+            done
+            echo ""
+        done
+        
+    } > "$output_file"
+    
+    log_info "CSV export completed successfully!"
+    log_info "Total folders: ${#folders[@]}"
+    log_info "Total users: ${#users[@]}"
+    
+    return 0
+}
+
 # Function to show usage
 show_usage() {
-    echo "Usage: $0 [output_file]"
+    echo "Usage: $0 [options] [output_file]"
     echo
-    echo "Export Synology Photos shared folder permissions to JSON format"
+    echo "Export Synology Photos shared folder permissions in various formats"
+    echo
+    echo "Options:"
+    echo "  -s, --summary     Generate a summary table instead of detailed JSON"
+    echo "  -c, --csv         Generate a CSV file for spreadsheet analysis"
+    echo "  -h, --help        Show this help message"
     echo
     echo "Arguments:"
-    echo "  output_file    - Optional path to output JSON file"
-    echo "                   Default: synology_photos_permissions_YYYYMMDD_HHMMSS.json"
+    echo "  output_file       - Optional path to output file"
+    echo "                      Default: synology_photos_permissions_YYYYMMDD_HHMMSS.json"
+    echo "                      or synology_photos_permissions_summary_YYYYMMDD_HHMMSS.txt for summary"
+    echo "                      or synology_photos_permissions_YYYYMMDD_HHMMSS.csv for CSV"
     echo
     echo "Examples:"
-    echo "  $0                                    - Export to default timestamped file"
-    echo "  $0 my_permissions.json               - Export to specific file"
-    echo "  $0 /path/to/backup/permissions.json  - Export to specific path"
+    echo "  $0                                    - Export detailed JSON to default timestamped file"
+    echo "  $0 my_permissions.json               - Export detailed JSON to specific file"
+    echo "  $0 --summary                         - Export summary table to default file"
+    echo "  $0 --summary permissions_table.txt   - Export summary table to specific file"
+    echo "  $0 --csv                             - Export CSV to default file"
+    echo "  $0 --csv permissions.csv             - Export CSV to specific file"
+    echo "  $0 /path/to/backup/permissions.json  - Export detailed JSON to specific path"
     echo
-    echo "Output JSON Structure:"
+    echo "JSON Output Structure:"
     echo "  - export_info: Metadata about the export"
     echo "  - shared_folders: Array of folders with user permissions"
     echo "    - folder_id: Database folder ID"
@@ -305,6 +638,18 @@ show_usage() {
     echo "      - permission_bitmap: Raw permission bitmap from database"
     echo "      - permissions_decoded: Human-readable permission array"
     echo "  - summary: Export statistics"
+    echo
+    echo "Summary Table Output:"
+    echo "  - Text table with folders as rows and users as columns"
+    echo "  - 'X' indicates user has permission on folder"
+    echo "  - '-' indicates user has no permission on folder"
+    echo "  - Includes summary statistics and coverage percentages"
+    echo
+    echo "CSV Output:"
+    echo "  - Spreadsheet-friendly format with folders as rows and users as columns"
+    echo "  - 'X' indicates user has permission on folder"
+    echo "  - '-' indicates user has no permission on folder"
+    echo "  - Perfect for filtering and analysis in Excel/LibreOffice/Google Sheets"
     echo
     echo "Permission Bitmap Values:"
     echo "  1 = viewer (view only)"
@@ -319,10 +664,64 @@ show_usage() {
 
 # Main function
 main() {
-    local output_file=${1:-$OUTPUT_FILE}
+    local summary_mode=false
+    local csv_mode=false
+    local output_file=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -s|--summary)
+                summary_mode=true
+                shift
+                ;;
+            -c|--csv)
+                csv_mode=true
+                shift
+                ;;
+            -h|--help|help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                if [ -z "$output_file" ]; then
+                    output_file="$1"
+                else
+                    log_error "Unknown option: $1"
+                    show_usage
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Check for conflicting options
+    if [ "$summary_mode" = true ] && [ "$csv_mode" = true ]; then
+        log_error "Cannot specify both --summary and --csv options"
+        show_usage
+        exit 1
+    fi
+    
+    # Set default output file based on mode
+    if [ -z "$output_file" ]; then
+        if [ "$summary_mode" = true ]; then
+            output_file="$SUMMARY_FILE"
+        elif [ "$csv_mode" = true ]; then
+            output_file="$CSV_FILE"
+        else
+            output_file="$OUTPUT_FILE"
+        fi
+    fi
     
     echo "======================================================"
-    echo "    SYNOLOGY PHOTOS PERMISSIONS JSON EXPORT"
+    if [ "$summary_mode" = true ]; then
+        echo "    SYNOLOGY PHOTOS PERMISSIONS SUMMARY EXPORT"
+    elif [ "$csv_mode" = true ]; then
+        echo "    SYNOLOGY PHOTOS PERMISSIONS CSV EXPORT"
+    else
+        echo "    SYNOLOGY PHOTOS PERMISSIONS JSON EXPORT"
+    fi
     echo "======================================================"
     echo "Started at: $(date)"
     echo "Log file: $LOG_FILE"
@@ -354,38 +753,84 @@ main() {
         fi
     fi
     
-    # Export to JSON
-    if export_to_json "$output_file"; then
-        echo
-        log_info "🎉 Export completed successfully!"
-        log_info "📁 Output file: $output_file"
-        log_info "📊 File size: $(du -h "$output_file" | cut -f1)"
-        
-        # Show a preview of the JSON structure
-        if command -v jq &> /dev/null; then
+    # Export based on mode
+    if [ "$summary_mode" = true ]; then
+        # Export summary table
+        if export_summary_table "$output_file"; then
             echo
-            log_info "📋 Preview of exported data:"
+            log_info "🎉 Summary export completed successfully!"
+            log_info "📁 Output file: $output_file"
+            log_info "📊 File size: $(du -h "$output_file" | cut -f1)"
+            
+            # Show a preview of the table
+            echo
+            log_info "📋 Preview of summary table:"
             echo "----------------------------------------"
-            jq -r '.summary' "$output_file" 2>/dev/null || echo "Summary preview unavailable"
+            head -30 "$output_file" | tail -20
             echo "----------------------------------------"
-            jq -r '.shared_folders[0] | {folder_id, folder_name, user_count: (.users | length)}' "$output_file" 2>/dev/null || echo "Folder preview unavailable"
-            echo "----------------------------------------"
+            echo "(Use 'cat $output_file' to view the complete table)"
+            
+            exit 0
+        else
+            log_error "Summary export failed"
+            exit 1
         fi
-        
-        exit 0
+    elif [ "$csv_mode" = true ]; then
+        # Export CSV
+        if export_to_csv "$output_file"; then
+            echo
+            log_info "🎉 CSV export completed successfully!"
+            log_info "📁 Output file: $output_file"
+            log_info "📊 File size: $(du -h "$output_file" | cut -f1)"
+            
+            # Show a preview of the CSV
+            echo
+            log_info "📋 Preview of CSV data (first 10 rows):"
+            echo "----------------------------------------"
+            head -11 "$output_file" | while IFS= read -r line; do
+                # Truncate long lines for preview
+                if [ ${#line} -gt 100 ]; then
+                    echo "${line:0:97}..."
+                else
+                    echo "$line"
+                fi
+            done
+            echo "----------------------------------------"
+            echo "(Open $output_file in Excel/LibreOffice/Google Sheets for full analysis)"
+            
+            exit 0
+        else
+            log_error "CSV export failed"
+            exit 1
+        fi
     else
-        log_error "Export failed"
-        exit 1
+        # Export to JSON
+        if export_to_json "$output_file"; then
+            echo
+            log_info "🎉 Export completed successfully!"
+            log_info "📁 Output file: $output_file"
+            log_info "📊 File size: $(du -h "$output_file" | cut -f1)"
+            
+            # Show a preview of the JSON structure
+            if command -v jq &> /dev/null; then
+                echo
+                log_info "📋 Preview of exported data:"
+                echo "----------------------------------------"
+                jq -r '.summary' "$output_file" 2>/dev/null || echo "Summary preview unavailable"
+                echo "----------------------------------------"
+                jq -r '.shared_folders[0] | {folder_id, folder_name, user_count: (.users | length)}' "$output_file" 2>/dev/null || echo "Folder preview unavailable"
+                echo "----------------------------------------"
+            fi
+            
+            exit 0
+        else
+            log_error "Export failed"
+            exit 1
+        fi
     fi
 }
 
 # Check if script is run directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Check for help flag
-    if [[ "$1" == "help" ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
-        show_usage
-        exit 0
-    fi
-    
     main "$@"
 fi
