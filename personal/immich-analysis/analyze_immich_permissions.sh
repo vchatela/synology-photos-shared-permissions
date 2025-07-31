@@ -277,9 +277,11 @@ analyze_discrepancies() {
     log_analysis "  Immich missing any permission: $immich_missing_count"
     echo
     
+    local exit_code
     if [ "$immich_missing_count" -eq 0 ]; then
         log_info "🎉 IMMICH HAS ACCESS TO ALL SHARED FOLDERS!"
         log_info "Immich user has some level of permission on all shared mathilde/valentin folders."
+        exit_code=0
     else
         log_warn "⚠ PERMISSION GAPS DETECTED:"
         log_warn "  - $immich_missing_count folders where immich has NO permission at all"
@@ -288,6 +290,7 @@ analyze_discrepancies() {
         log_analysis "  1. Give immich any permission level (suggest viewer) on missing folders"
         log_analysis "  2. Consider running the permission injection script (when available)"
         log_analysis "  3. Manually verify in Synology Photos admin interface"
+        exit_code=1
     fi
     
     # Display detailed recommendations
@@ -313,11 +316,7 @@ analyze_discrepancies() {
     fi
     
     # Return appropriate exit code
-    if [ "$immich_missing_count" -eq 0 ]; then
-        return 0
-    else
-        return 1
-    fi
+    return $exit_code
 }
 
 # Function to generate SQL commands for permission injection (RISKY - READ ONLY FOR NOW)
@@ -443,6 +442,11 @@ show_usage() {
     echo "  generate-sql         - Generate SQL injection commands (DRY RUN)"
     echo "  help                 - Show this help message"
     echo
+    echo "Exit Codes:"
+    echo "  0 - No permission gaps found (immich has access to all shared folders)"
+    echo "  1 - Permission gaps detected (immich missing access to some folders)"
+    echo "  2 - Script error or invalid arguments"
+    echo
     echo "Examples:"
     echo "  $0                   - Run basic console analysis"
     echo "  $0 analyze-json      - Analyze and save results to JSON"
@@ -462,7 +466,7 @@ main() {
     
     # Validate setup
     if ! validate_setup; then
-        exit 1
+        exit 2
     fi
     
     case "$command" in
@@ -489,7 +493,7 @@ main() {
         *)
             log_error "Unknown command: $command"
             show_usage
-            exit 1
+            exit 2
             ;;
     esac
 }
