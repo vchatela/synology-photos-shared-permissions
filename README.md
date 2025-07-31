@@ -129,6 +129,77 @@ And here was the source:
 
 ### Core Scripts
 
+#### `export_permissions_json.sh` - Database Permissions Export
+Exports all shared folder permissions from the Synology Photos database to structured JSON format. Usage:
+```bash
+./export_permissions_json.sh [output_file]
+```
+
+**Key Features:**
+- Extracts complete permission structure from synofoto database
+- Role-based permission decoding (viewer, downloader, uploader, manager, admin)
+- JSON output with validation and optional formatting
+- Exports saved to dedicated `exports/` folder
+- Comprehensive logging and error handling
+
+**Permission Structure:**
+The script maps database permission bitmaps to human-readable roles:
+- **1** = viewer (view only)
+- **3** = downloader (view + download)
+- **7** = uploader (view + download + upload)
+- **15** = manager (view + download + upload + manage)
+- **31** = admin (all permissions)
+
+**Output JSON Structure:**
+```json
+{
+  "export_info": {
+    "timestamp": "2025-01-31T15:30:45+01:00",
+    "source_database": "synofoto",
+    "permission_bitmap_legend": { ... }
+  },
+  "shared_folders": [
+    {
+      "folder_id": 304,
+      "folder_name": "/Scans/2024/janvier",
+      "users": [
+        {
+          "user_id": 11,
+          "username": "famille",
+          "permission_bitmap": 3,
+          "permissions_decoded": {
+            "role": "downloader",
+            "permissions": ["view", "download"]
+          }
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "total_shared_folders": 25,
+    "total_user_permissions": 157
+  }
+}
+```
+
+**Database Query:**
+The script uses this core query to extract permissions:
+```sql
+SELECT 
+    f.id as folder_id,
+    f.name as folder_name,
+    f.passphrase_share,
+    ui.id as user_id,
+    ui.name as username,
+    ui.uid as user_uid,
+    sp.permission as permission_bitmap
+FROM folder f
+JOIN share_permission sp ON f.passphrase_share = sp.passphrase_share
+LEFT JOIN user_info ui ON sp.target_id = ui.id
+WHERE f.id > 1 AND sp.permission > 0 AND sp.target_id != 0
+ORDER BY f.id, ui.name;
+```
+
 #### `sync_permissions.sh` - Individual Folder Synchronization
 Synchronizes filesystem ACLs with database permissions for a specific folder. Usage:
 ```bash
@@ -199,6 +270,18 @@ For automated/scheduled runs:
 ```bash
 ./batch_sync.sh --silent && ./permission_audit.sh summary
 ```
+
+For database backup and analysis:
+```bash
+./export_permissions_json.sh
+```
+
+### File Organization
+
+- **Scripts**: Main directory contains all executable scripts
+- **Logs**: `logs/` folder contains execution logs for all scripts
+- **Exports**: `exports/` folder contains JSON exports from permission analysis
+- **Personal**: `personal/` folder contains user-specific customizations and extensions
 
 This will:
 1. Synchronize all shared folder permissions system-wide
