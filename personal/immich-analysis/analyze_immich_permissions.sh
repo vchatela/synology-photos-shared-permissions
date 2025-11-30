@@ -64,6 +64,54 @@ validate_setup() {
     return 0
 }
 
+# Function to load excluded folders from config file
+load_excluded_folders() {
+    local exclusion_file="$SCRIPT_DIR/excluded_folders.conf"
+    declare -g -a EXCLUDED_FOLDERS
+    
+    if [ ! -f "$exclusion_file" ]; then
+        log_debug "No exclusion file found at $exclusion_file"
+        return 0
+    fi
+    
+    log_debug "Loading excluded folders from: $exclusion_file"
+    
+    local count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip empty lines and comments
+        if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
+            continue
+        fi
+        
+        # Trim whitespace
+        line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        
+        if [ -n "$line" ]; then
+            EXCLUDED_FOLDERS+=("$line")
+            ((count++))
+        fi
+    done < "$exclusion_file"
+    
+    if [ $count -gt 0 ]; then
+        log_info "Loaded $count excluded folder(s) from config file"
+    fi
+    
+    return 0
+}
+
+# Function to check if a folder is excluded
+is_folder_excluded() {
+    local folder_name="$1"
+    
+    for excluded in "${EXCLUDED_FOLDERS[@]}"; do
+        if [ "$folder_name" = "$excluded" ]; then
+            return 0  # Found - folder is excluded
+        fi
+    done
+    
+    return 1  # Not found - folder is not excluded
+}
+
 # Function to get folders where both mathilde and valentin have permissions
 get_shared_mathilde_valentin_folders() {
     sudo -u postgres psql -d synofoto -t -A -c "
@@ -148,6 +196,9 @@ analyze_discrepancies() {
         output_file="$EXPORTS_DIR/immich_permission_analysis_$(date +%Y%m%d_%H%M%S).csv"
     fi
     
+    # Load excluded folders from config
+    load_excluded_folders
+    
     echo "======================================================" | tee -a "$LOG_FILE"
     echo "    IMMICH PERMISSION DISCREPANCY ANALYSIS" | tee -a "$LOG_FILE"
     echo "======================================================" | tee -a "$LOG_FILE"
@@ -163,10 +214,12 @@ analyze_discrepancies() {
     local total_shared_folders=0
     local immich_missing_count=0
     local immich_has_access_count=0
+    local immich_missing_excluded_count=0
     
     # Arrays to store results
     declare -a missing_folders
     declare -a compliant_folders
+    declare -a excluded_missing_folders
     
     # Start JSON output if requested
     if [ "$output_format" = "json" ]; then
@@ -206,16 +259,29 @@ analyze_discrepancies() {
         local issue_type=""
         
         if [ -z "$immich_perm" ] || [ "$immich_perm" -eq 0 ]; then
-            # Immich has no permission - needs any permission
-            ((immich_missing_count++))
-            status="MISSING"
-            issue_type="no_permission"
+            # Immich has no permission - check if excluded
             immich_role="none"
-            missing_folders+=("$folder_id|$folder_name|$recommended_perm|$recommended_role")
             
-            log_discrepancy "Folder $folder_id ($folder_name): immich has NO permission"
-            log_discrepancy "  Mathilde: $mathilde_role ($mathilde_perm), Valentin: $valentin_role ($valentin_perm)"
-            log_discrepancy "  Recommended: Give immich any permission (suggest $recommended_role)"
+            if is_folder_excluded "$folder_name"; then
+                # Folder is excluded - don't count as missing
+                ((immich_missing_excluded_count++))
+                status="EXCLUDED"
+                issue_type="excluded_no_permission"
+                excluded_missing_folders+=("$folder_id|$folder_name|$recommended_perm|$recommended_role")
+                
+                log_debug "Folder $folder_id ($folder_name): immich has NO permission (EXCLUDED from alerts)"
+                log_debug "  Mathilde: $mathilde_role ($mathilde_perm), Valentin: $valentin_role ($valentin_perm)"
+            else
+                # Not excluded - needs any permission
+                ((immich_missing_count++))
+                status="MISSING"
+                issue_type="no_permission"
+                missing_folders+=("$folder_id|$folder_name|$recommended_perm|$recommended_role")
+                
+                log_discrepancy "Folder $folder_id ($folder_name): immich has NO permission"
+                log_discrepancy "  Mathilde: $mathilde_role ($mathilde_perm), Valentin: $valentin_role ($valentin_perm)"
+                log_discrepancy "  Recommended: Give immich any permission (suggest $recommended_role)"
+            fi
             
         else
             # Immich has some permission - that's sufficient
@@ -260,7 +326,8 @@ analyze_discrepancies() {
         echo "  \"summary\": {" >> "$output_file"
         echo "    \"total_shared_folders\": $total_shared_folders," >> "$output_file"
         echo "    \"immich_has_permission\": $immich_has_access_count," >> "$output_file"
-        echo "    \"immich_missing_permission\": $immich_missing_count" >> "$output_file"
+        echo "    \"immich_missing_permission\": $immich_missing_count," >> "$output_file"
+        echo "    \"immich_missing_excluded\": $immich_missing_excluded_count" >> "$output_file"
         echo "  }" >> "$output_file"
         echo "}" >> "$output_file"
     fi
@@ -275,6 +342,9 @@ analyze_discrepancies() {
     log_analysis "  Total folders where mathilde AND valentin have access: $total_shared_folders"
     log_analysis "  Immich has some permission: $immich_has_access_count"
     log_analysis "  Immich missing any permission: $immich_missing_count"
+    if [ "$immich_missing_excluded_count" -gt 0 ]; then
+        log_analysis "  Immich missing but excluded (intentional): $immich_missing_excluded_count"
+    fi
     echo
     
     local exit_code
@@ -305,6 +375,21 @@ analyze_discrepancies() {
             IFS='|' read -r folder_id folder_name rec_perm rec_role <<< "$folder_info"
             printf "%-4s | %-16s | %s\n" "$folder_id" "$rec_role ($rec_perm)" "$folder_name" | tee -a "$LOG_FILE"
         done
+    fi
+    
+    # Display excluded folders (for reference)
+    if [ "$immich_missing_excluded_count" -gt 0 ]; then
+        echo
+        echo "======================================================" | tee -a "$LOG_FILE"
+        echo "   EXCLUDED FOLDERS (immich intentionally has no access)" | tee -a "$LOG_FILE"
+        echo "======================================================" | tee -a "$LOG_FILE"
+        echo "ID   | Status           | Folder Name" | tee -a "$LOG_FILE"
+        echo "-----|------------------|------------------------------------------" | tee -a "$LOG_FILE"
+        for folder_info in "${excluded_missing_folders[@]}"; do
+            IFS='|' read -r folder_id folder_name rec_perm rec_role <<< "$folder_info"
+            printf "%-4s | %-16s | %s\n" "$folder_id" "excluded" "$folder_name" | tee -a "$LOG_FILE"
+        done
+        echo "Note: Edit excluded_folders.conf to modify exclusions" | tee -a "$LOG_FILE"
     fi
     
     if [ -n "$output_file" ]; then
@@ -452,6 +537,11 @@ show_usage() {
     echo "  $0 analyze-json      - Analyze and save results to JSON"
     echo "  $0 analyze-csv       - Analyze and save results to CSV"
     echo "  $0 generate-sql      - Generate SQL commands for permission injection"
+    echo
+    echo "Exclusions:"
+    echo "  Edit 'excluded_folders.conf' to exclude specific folders from alerts."
+    echo "  Excluded folders are folders where it's intentional that immich has no access."
+    echo "  Format: One folder name per line (matching database folder.name exactly)"
     echo
     echo "Output files are saved to: exports/"
     echo "All results are logged to: logs/permission_analysis_YYYYMMDD_HHMMSS.log"
